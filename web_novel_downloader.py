@@ -4,7 +4,6 @@ import concurrent.futures
 import json
 import os
 import re
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -68,9 +67,9 @@ class WebNovelDownloader:
     FANQIE_DOMAIN = "fanqienovel.com"
     CODE = ((58344, 58715), (58345, 58716))
     MAX_WORKERS = 3
-    _last_request_time = 0.0
-    _request_interval = 1.0  # Seconds between requests globally
-    _rate_limit_lock = threading.Lock()
+    DEFAULT_REQUEST_INTERVAL = 0.3
+    MAX_REQUEST_INTERVAL = 3.0
+    RATE_LIMIT_SUCCESS_WINDOW = 20
     MAX_CONTENT_RETRIES = 3
     MAX_CATALOG_PAGES = 200
     MAX_CHAPTER_PAGES = 24
@@ -185,10 +184,8 @@ class WebNovelDownloader:
     NEXT_PAGE_TEXTS = (
         "\u4e0b\u4e00\u9875",
         "\u4e0b\u9875",
-        "\u4e0b\u4e00\u7ae0",
-        "\u4e0b\u7ae0",
-        "next",
         "next page",
+        "next",
     )
 
     PLACEHOLDER_HINTS = (
@@ -217,6 +214,11 @@ class WebNovelDownloader:
         self.log_callback = log_callback
         self.language = language
         self.is_cancelled = False
+        self._rate_limit_lock = threading.Lock()
+        self._next_request_time = 0.0
+        self._cooldown_until = 0.0
+        self._request_interval = self.DEFAULT_REQUEST_INTERVAL
+        self._success_streak = 0
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -259,23 +261,28 @@ class WebNovelDownloader:
         return self._download_generic_book(normalized_url, title_override.strip())
 
     def normalize_url(self, url: str) -> str:
-        url = url.strip()
-        if not url.startswith("http"):
-            url = "http://" + url
-        
-        # Site-specific normalization (Mobile versions are better for scraping)
-        if "bikuxs.com" in url:
-            if "www.bikuxs.com" in url:
-                url = url.replace("www.bikuxs.com", "m.bikuxs.com")
-            elif "m.bikuxs.com" not in url:
-                # Handle cases like bikuxs.com/shu/...
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                if parsed.netloc == "bikuxs.com":
-                    url = url.replace("bikuxs.com", "m.bikuxs.com")
-        
+        url = (url or "").strip()
+        if not url:
+            raise WebDownloadError("URL is required.")
         if not re.match(r"^https?://", url, re.IGNORECASE):
-            url = "https://" + url
+            url = "http://" + url
+
+        parsed = urlparse(url)
+        if (parsed.hostname or "").lower() == "bikuxs.com":
+            parsed = parsed._replace(netloc="www.bikuxs.com")
+        return urlunparse(parsed)
+
+    def replace_bikuxs_host(self, url: str, hostname: str) -> str:
+        parsed = urlparse(url)
+        current_host = (parsed.hostname or "").lower()
+        if current_host not in {"www.bikuxs.com", "m.bikuxs.com", "bikuxs.com"}:
+            return url
+        return urlunparse(parsed._replace(netloc=hostname))
+
+    def preferred_chapter_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        if (parsed.hostname or "").lower().endswith("bikuxs.com") and parsed.path.lower().endswith(".html"):
+            return self.replace_bikuxs_host(url, "www.bikuxs.com")
         return url
 
     def get_headers(self, url: str, referer: str = "") -> dict:
@@ -404,9 +411,12 @@ class WebNovelDownloader:
 
     def _download_generic_book(self, url: str, title_override: str) -> DownloadResult:
         self.log("Using the generic web novel downloader.")
-        initial_soup = self.fetch_soup(url)
+        url, initial_soup = self.fetch_soup_with_site_fallback(url)
         catalog_url = self.resolve_catalog_url(url, initial_soup)
-        catalog_soup = initial_soup if catalog_url == url else self.fetch_soup(catalog_url, referer=url)
+        if catalog_url == url:
+            catalog_soup = initial_soup
+        else:
+            catalog_url, catalog_soup = self.fetch_soup_with_site_fallback(catalog_url, referer=url)
         chapter_links = self.extract_chapter_links(catalog_url, catalog_soup)
 
         if len(chapter_links) < 3:
@@ -485,7 +495,20 @@ class WebNovelDownloader:
 
     def download_generic_chapter(self, url: str, title_hint: str = "") -> tuple[str, str]:
         self.log(f"Downloading: {title_hint or url}")
-        chapter_title, parts = self.collect_chapter_pages(url, title_hint)
+        preferred_url = self.preferred_chapter_url(url)
+        fallback_url = self.replace_bikuxs_host(preferred_url, "m.bikuxs.com")
+        can_fallback = fallback_url != preferred_url
+
+        try:
+            chapter_title, parts = self.collect_chapter_pages(preferred_url, title_hint)
+            if parts or not can_fallback:
+                return chapter_title, "\n\n".join(parts).strip()
+        except (requests.exceptions.RequestException, WebDownloadError):
+            if self.is_cancelled or not can_fallback:
+                raise
+
+        self.log(f"Desktop chapter failed, retrying mobile page: {fallback_url}")
+        chapter_title, parts = self.collect_chapter_pages(fallback_url, title_hint)
         return chapter_title, "\n\n".join(parts).strip()
 
     def collect_chapter_pages(self, url: str, title_hint: str = "") -> tuple[str, list[str]]:
@@ -557,59 +580,126 @@ class WebNovelDownloader:
             return last_content, last_title, last_next_page
         return "", last_title, last_next_page
 
+    def _wait_for_request_slot(self):
+        while True:
+            with self._rate_limit_lock:
+                now = time.monotonic()
+                ready_at = max(self._next_request_time, self._cooldown_until)
+                if now >= ready_at:
+                    self._next_request_time = now + self._request_interval
+                    return
+                delay = ready_at - now
+
+            time.sleep(delay)
+
+    def _retry_after_seconds(self, response, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After", "").strip()
+        try:
+            return max(1.0, min(60.0, float(retry_after)))
+        except (TypeError, ValueError):
+            return min(30.0, 2.0 * (2 ** attempt))
+
+    def _register_rate_limit(self, wait_time: float):
+        with self._rate_limit_lock:
+            now = time.monotonic()
+            self._request_interval = min(
+                self.MAX_REQUEST_INTERVAL,
+                max(self.DEFAULT_REQUEST_INTERVAL + 0.2, self._request_interval * 1.6),
+            )
+            self._success_streak = 0
+            self._cooldown_until = max(self._cooldown_until, now + wait_time)
+
+    def _register_request_success(self):
+        with self._rate_limit_lock:
+            self._success_streak += 1
+            if self._success_streak < self.RATE_LIMIT_SUCCESS_WINDOW:
+                return
+
+            self._request_interval = max(
+                self.DEFAULT_REQUEST_INTERVAL,
+                self._request_interval * 0.85,
+            )
+            self._success_streak = 0
+
     def fetch_html(self, url: str, referer: str = "", retry_on_429: bool = True) -> str:
         headers = self.get_headers(url, referer)
         max_retries = 5 if retry_on_429 else 1
-        
+        last_error = None
+
         for attempt in range(max_retries):
-            # Global rate limiting across all threads
-            with self._rate_limit_lock:
-                now = time.time()
-                elapsed = now - self._last_request_time
-                if elapsed < self._request_interval:
-                    time.sleep(self._request_interval - elapsed)
-                self._last_request_time = time.time()
+            self._wait_for_request_slot()
 
             try:
                 response = self.session.get(url, timeout=30, headers=headers)
-                
-                if response.status_code == 429 and retry_on_429:
-                    wait_time = 2 + attempt * 2
-                    self.log(f"Rate limited (429) at {url}. Waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    # Increase the interval slightly if we hit 429
-                    with self._rate_limit_lock:
-                        self._request_interval = min(2.5, self._request_interval + 0.2)
-                    continue
-                
-                response.raise_for_status()
-                
-                # Successful request, maybe slowly decrease the interval
-                with self._rate_limit_lock:
-                    self._request_interval = max(0.8, self._request_interval - 0.01)
 
-                # Enhanced encoding detection
+                if response.status_code == 429 and retry_on_429:
+                    wait_time = self._retry_after_seconds(response, attempt)
+                    self._register_rate_limit(wait_time)
+                    last_error = WebDownloadError(f"Server repeatedly rate limited request: {url}")
+                    self.log(f"Rate limited (429) at {url}. Shared cooldown {wait_time:g}s...")
+                    continue
+
+                response.raise_for_status()
+
+                self._register_request_success()
+
                 if not response.encoding or response.encoding.lower() == 'iso-8859-1':
                     response.encoding = response.apparent_encoding or "utf-8"
-                
+
                 return response.text
             except requests.exceptions.HTTPError as exc:
                 if exc.response is not None:
                     if exc.response.status_code == 429 and retry_on_429:
-                        continue # Should be handled above but being safe
+                        continue
                     if exc.response.status_code == 403:
                         hostname = urlparse(url).hostname or "the website"
                         trans = TRANSLATIONS.get(self.language, TRANSLATIONS["EN"])
                         raise WebDownloadError(trans["access_denied"].format(url=url, hostname=hostname)) from exc
                 raise
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_error = exc
                 if attempt < max_retries - 1:
                     self.log(f"Network error at {url}: {exc}. Retrying...")
-                    time.sleep(2)
+                    time.sleep(min(4.0, 1.0 + attempt))
                     continue
                 raise
-        
-        return ""
+
+        if last_error:
+            raise last_error
+        raise WebDownloadError(f"Failed to download: {url}")
+
+    def post_html(self, url: str, payload: dict, referer: str) -> str:
+        last_error = None
+        for attempt in range(3):
+            self._wait_for_request_slot()
+            try:
+                response = self.session.post(
+                    url,
+                    data=payload,
+                    headers={"Referer": referer},
+                    timeout=15,
+                )
+                if response.status_code == 429:
+                    wait_time = self._retry_after_seconds(response, attempt)
+                    self._register_rate_limit(wait_time)
+                    last_error = WebDownloadError(f"Server repeatedly rate limited request: {url}")
+                    self.log(f"Rate limited (429) at {url}. Shared cooldown {wait_time:g}s...")
+                    continue
+
+                response.raise_for_status()
+                self._register_request_success()
+                response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+                return response.text
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise WebDownloadError(f"Failed to download dynamic content: {url}")
 
     def resolve_ajax_content(self, url: str, html: str) -> str:
         ajax_match = re.search(r'\$\.ajax\(\{\s*type\s*:\s*[\'"]post[\'"]\s*,\s*url\s*:\s*[\'"]([^\'"]+)[\'"]\s*,\s*data\s*:\s*\{(.*?)\}', html, re.IGNORECASE)
@@ -628,18 +718,31 @@ class WebNovelDownloader:
                     k, v = kv.split(":", 1)
                     payload[k.strip(" '\"")] = v.strip(" '\"")
             
-            res = self.session.post(api_url, data=payload, headers={"Referer": url}, timeout=10)
-            res.raise_for_status()
-            res.encoding = res.apparent_encoding or res.encoding or "utf-8"
-            
-            # Combine the dynamic text cleanly for the parser
-            return html + f'<div id="ajax-loaded-content">{res.text}</div>'
+            dynamic_html = self.post_html(api_url, payload, url)
+            return html + f'<div id="ajax-loaded-content">{dynamic_html}</div>'
         except Exception as exc:
             self.log(f"Failed to fetch dynamic AJAX content for {url}: {exc}")
             return html
 
     def fetch_soup(self, url: str, referer: str = "") -> BeautifulSoup:
         return BeautifulSoup(self.fetch_html(url, referer=referer), "html.parser")
+
+    def fetch_soup_with_site_fallback(
+        self,
+        url: str,
+        referer: str = "",
+    ) -> tuple[str, BeautifulSoup]:
+        try:
+            return url, self.fetch_soup(url, referer=referer)
+        except (requests.exceptions.RequestException, WebDownloadError):
+            parsed = urlparse(url)
+            if self.is_cancelled or (parsed.hostname or "").lower() != "www.bikuxs.com":
+                raise
+
+        fallback_url = self.replace_bikuxs_host(url, "m.bikuxs.com")
+        fallback_referer = self.replace_bikuxs_host(referer, "m.bikuxs.com") if referer else ""
+        self.log(f"Desktop catalog failed, retrying mobile page: {fallback_url}")
+        return fallback_url, self.fetch_soup(fallback_url, referer=fallback_referer)
 
     def extract_chapter_links(self, base_url: str, soup: BeautifulSoup) -> list[ChapterLink]:
         catalog_pages = self.collect_catalog_pages(base_url, soup)
@@ -697,7 +800,7 @@ class WebNovelDownloader:
     def find_next_catalog_page(self, current_url: str, soup: BeautifulSoup) -> str:
         for anchor in soup.select("a[href]"):
             label = self.clean_text(anchor.get_text(" ", strip=True)).lower()
-            if any(keyword in label for keyword in self.NEXT_PAGE_TEXTS):
+            if self.is_next_page_label(label):
                 href = self.normalize_link(current_url, anchor.get("href"))
                 if href and self.is_catalog_pagination_candidate(current_url, href):
                     return href
@@ -719,7 +822,7 @@ class WebNovelDownloader:
     def find_next_chapter_page(self, current_url: str, soup: BeautifulSoup) -> str:
         for anchor in soup.select("a[href]"):
             label = self.clean_text(anchor.get_text(" ", strip=True)).lower()
-            if not any(keyword in label for keyword in self.NEXT_PAGE_TEXTS):
+            if not self.is_next_page_label(label):
                 continue
 
             href = self.normalize_link(current_url, anchor.get("href"))
@@ -734,6 +837,11 @@ class WebNovelDownloader:
                 return guessed
 
         return ""
+
+    def is_next_page_label(self, label: str) -> bool:
+        normalized = self.clean_text(label).lower()
+        normalized = re.sub(r"^[\[\(\u3010\uff08<]+|[\]\)\u3011\uff09>\u00bb\u203a\u2192]+$", "", normalized).strip()
+        return normalized in self.NEXT_PAGE_TEXTS
 
     def is_catalog_pagination_candidate(self, current_url: str, next_url: str) -> bool:
         current = urlparse(current_url)
@@ -761,19 +869,31 @@ class WebNovelDownloader:
         if next_url == current_url:
             return False
 
-        current_base = self.base_page_identity(current.path)
-        next_base = self.base_page_identity(next_page.path)
-        if current_base == next_base:
-            return True
+        return self.chapter_page_identity(current_url) == self.chapter_page_identity(next_url)
 
-        if current.path == next_page.path and current.query != next_page.query:
-            return True
+    def chapter_page_identity(self, url: str) -> tuple[str, str, str]:
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/")
+        path = re.sub(r"_(\d+)\.html$", ".html", path, flags=re.IGNORECASE)
+        path = re.sub(r"/page/\d+$", "/page", path, flags=re.IGNORECASE)
 
-        return False
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query.pop("page", None)
+        stable_query = urlencode(sorted(query.items()), doseq=True)
+        return (parsed.hostname or "", path, stable_query)
 
     def build_next_chapter_page_url(self, current_url: str) -> str:
         parsed = urlparse(current_url)
         path = parsed.path
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if "page" in query:
+            try:
+                page_num = int(query["page"][0])
+            except Exception:
+                page_num = 1
+            query["page"] = [str(page_num + 1)]
+            return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
         match = re.search(r"_(\d+)\.html$", path, re.IGNORECASE)
         if match:
@@ -788,15 +908,6 @@ class WebNovelDownloader:
         if path.endswith("/"):
             new_path = path + "index_2.html"
             return urlunparse(parsed._replace(path=new_path))
-
-        query = parse_qs(parsed.query, keep_blank_values=True)
-        if "page" in query:
-            try:
-                page_num = int(query["page"][0])
-            except Exception:
-                page_num = 1
-            query["page"] = [str(page_num + 1)]
-            return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
         return ""
 

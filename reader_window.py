@@ -51,6 +51,7 @@ class ReaderWindow(QMainWindow):
         self.current_novel = None
         self._hidden_progress_state = None
         self._last_saved_signature = None
+        self._restoring_progress = False
 
         self.setWindowTitle("MoYu Reader")
         self.setMinimumSize(420, 620)
@@ -180,7 +181,7 @@ class ReaderWindow(QMainWindow):
         self.opacity_effect.setOpacity(opacity)
 
     def schedule_progress_save(self, *_):
-        if self.current_novel:
+        if self.current_novel and not self._restoring_progress:
             self.progress_save_timer.start(450)
 
     def current_view_position(self):
@@ -212,9 +213,12 @@ class ReaderWindow(QMainWindow):
         }
 
     def set_cursor_position(self, pos):
+        document_length = max(0, self.reader_area.document().characterCount() - 1)
+        pos = max(0, min(int(pos), document_length))
         cursor = self.reader_area.textCursor()
         cursor.setPosition(pos)
         self.reader_area.setTextCursor(cursor)
+        return pos
 
     def persist_progress(self, force=False):
         if not self.current_novel:
@@ -247,9 +251,7 @@ class ReaderWindow(QMainWindow):
             return
 
         target = state or self.current_novel
-        document_length = max(0, self.reader_area.document().characterCount() - 1)
-        pos = min(target.get("last_pos", 0), document_length)
-        self.set_cursor_position(pos)
+        self.set_cursor_position(target.get("last_pos", 0))
 
         scroll_bar = self.reader_area.verticalScrollBar()
         if use_saved_scroll:
@@ -276,10 +278,13 @@ class ReaderWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.restore_progress(True))
 
     def load_novel(self, novel_data):
+        self.progress_save_timer.stop()
+        self._restoring_progress = True
         self.current_novel = novel_data
         self._hidden_progress_state = None
         self._last_saved_signature = None
         restore_saved_scroll = novel_data.pop("_restore_saved_scroll", True)
+        expected_path = novel_data["path"]
 
         content, chapters = self.logic.load_txt(novel_data["path"])
         self.chapters = chapters
@@ -292,8 +297,23 @@ class ReaderWindow(QMainWindow):
             self.toc_menu.addAction(action)
 
         self.restore_progress(restore_saved_scroll, self.current_novel)
-        QTimer.singleShot(120, lambda: self.restore_progress(restore_saved_scroll, self.current_novel))
-        QTimer.singleShot(180, lambda: self.persist_progress(force=True))
+        QTimer.singleShot(
+            0,
+            lambda: self._finish_initial_restore(expected_path, restore_saved_scroll, False),
+        )
+        QTimer.singleShot(
+            120,
+            lambda: self._finish_initial_restore(expected_path, restore_saved_scroll, True),
+        )
+
+    def _finish_initial_restore(self, expected_path, use_saved_scroll, persist):
+        if not self.current_novel or self.current_novel.get("path") != expected_path:
+            return
+
+        self.restore_progress(use_saved_scroll, self.current_novel)
+        if persist:
+            self._restoring_progress = False
+            self.persist_progress(force=True)
 
     def jump_to_chapter(self, index):
         if 0 <= index < len(self.chapters):

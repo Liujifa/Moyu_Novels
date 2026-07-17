@@ -80,7 +80,7 @@ class LibraryView(QWidget):
         self.settings = self.manager.get_settings()
         self.current_chapters = []
         self.current_novel_path = None
-        self.chapter_manually_selected = False
+        self.pending_chapter_pos = None
         self.init_ui()
 
     def init_ui(self):
@@ -131,7 +131,7 @@ class LibraryView(QWidget):
         self.chapter_layout = QVBoxLayout(self.chapter_group)
         self.chapter_layout.setSpacing(10)
         self.chapter_combo = QComboBox()
-        self.chapter_combo.currentIndexChanged.connect(self.on_chapter_changed)
+        self.chapter_combo.activated.connect(self.on_chapter_changed)
         self.chapter_layout.addWidget(self.chapter_combo)
 
         self.progress_label = QLabel()
@@ -249,7 +249,7 @@ class LibraryView(QWidget):
             self.progress_label.setText(self.t("no_chapters"))
             return
 
-        if self.chapter_manually_selected and self.chapter_combo.currentIndex() >= 0:
+        if self.pending_chapter_pos is not None and self.chapter_combo.currentIndex() >= 0:
             chapter_title = self.chapter_combo.currentText().strip()
             self.progress_label.setText(f"{self.t('next_start')}{chapter_title}")
             return
@@ -293,13 +293,14 @@ class LibraryView(QWidget):
         if not novel:
             self.current_novel_path = None
             self.current_chapters = []
+            self.pending_chapter_pos = None
             self.chapter_combo.clear()
             self.update_progress_label(0)
             return
 
         self.current_novel_path = novel["path"]
         self.current_chapters = self.logic.get_chapters(novel["path"])
-        self.chapter_manually_selected = False
+        self.pending_chapter_pos = None
 
         self.chapter_combo.blockSignals(True)
         self.chapter_combo.clear()
@@ -311,7 +312,8 @@ class LibraryView(QWidget):
 
     def on_chapter_changed(self, index):
         if index >= 0 and self.current_chapters:
-            self.chapter_manually_selected = True
+            chapter_pos = self.chapter_combo.itemData(index)
+            self.pending_chapter_pos = int(chapter_pos) if chapter_pos is not None else None
             self.update_progress_label()
 
     def sync_progress(self, path, pos):
@@ -323,7 +325,11 @@ class LibraryView(QWidget):
         if path != self.current_novel_path:
             return
 
-        self.chapter_manually_selected = False
+        # 阅读器的延迟进度信号不能覆盖用户尚未执行的章节选择。
+        if self.pending_chapter_pos is not None:
+            self.update_progress_label()
+            return
+
         self.sync_combo_to_progress(pos)
 
     def on_add_novel(self):
@@ -362,7 +368,7 @@ class LibraryView(QWidget):
         self.manager.remove_novel(novel["path"])
         self.current_novel_path = None
         self.current_chapters = []
-        self.chapter_manually_selected = False
+        self.pending_chapter_pos = None
         self.refresh_library()
 
         if self.novel_list.count() > 0:
@@ -378,12 +384,11 @@ class LibraryView(QWidget):
             return
 
         start_pos = novel.get("last_pos", 0)
-        if self.chapter_manually_selected and self.chapter_combo.currentIndex() >= 0:
-            chapter_pos = self.chapter_combo.currentData()
-            if chapter_pos is not None:
-                start_pos = int(chapter_pos)
+        if self.pending_chapter_pos is not None:
+            start_pos = self.pending_chapter_pos
 
         self.novel_selected.emit(novel.copy(), start_pos)
+        self.pending_chapter_pos = None
 
     def on_change_color(self):
         color = QColorDialog.getColor(QColor(self.settings["font_color"]), self)
