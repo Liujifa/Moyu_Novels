@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import parse_qs, urlencode, urldefrag, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlencode, urldefrag, urljoin, urlparse, urlunparse
 
 try:
     import requests
@@ -23,6 +23,7 @@ except ImportError as exc:
     IMPORT_ERROR = exc
 
 from browser_cookie_importer import CookieImportError, import_browser_cookies
+from novel_page_parser import NovelPageParser
 
 TRANSLATIONS = {
     "CN": {
@@ -75,7 +76,8 @@ class WebNovelDownloader:
     MAX_CONTENT_RETRIES = 3
     MAX_CATALOG_PAGES = 200
     MAX_CHAPTER_PAGES = 24
-    CHAPTER_CACHE_VERSION = 2
+    MAX_DISCOVERY_PAGES = 6
+    CHAPTER_CACHE_VERSION = 3
 
     CHAPTER_SKIP_KEYWORDS = (
         "\u4e0a\u4e00\u7ae0",
@@ -205,7 +207,8 @@ class WebNovelDownloader:
         download_dir: str,
         progress_callback: ProgressCallback = None,
         log_callback: LogCallback = None,
-        language: str = "CN"
+        language: str = "CN",
+        extraction_rules: Optional[dict[str, str]] = None,
     ):
         if IMPORT_ERROR is not None or requests is None or BeautifulSoup is None:
             raise WebDownloadError(
@@ -218,6 +221,7 @@ class WebNovelDownloader:
         self.language = language
         self.is_cancelled = False
         self._used_chapter_cache = set()
+        self._response_state = threading.local()
         self._rate_limit_lock = threading.Lock()
         self._next_request_time = 0.0
         self._cooldown_until = 0.0
@@ -243,6 +247,10 @@ class WebNovelDownloader:
         )
         os.makedirs(self.download_dir, exist_ok=True)
         self.charset = self._load_charset()
+        try:
+            self.parser = NovelPageParser(self.normalize_link, self.is_same_site, extraction_rules)
+        except ValueError as exc:
+            raise WebDownloadError(str(exc)) from exc
 
     def log(self, message: str):
         if self.log_callback:
@@ -418,69 +426,99 @@ class WebNovelDownloader:
         return chapter_title, content.strip()
 
     def _download_generic_book(self, url: str, title_override: str) -> DownloadResult:
-        self.log("Using the generic web novel downloader.")
+        self.log("正在使用通用解析：识别目录结构、链接规律和页面内嵌数据。")
+        if urlparse(url).path.lower().endswith(".txt"):
+            return self._download_text_file(url, title_override)
         url, initial_soup = self.fetch_soup_with_site_fallback(url)
-        catalog_url = self.resolve_catalog_url(url, initial_soup)
-        if catalog_url == url:
-            catalog_soup = initial_soup
-        else:
-            catalog_url, catalog_soup = self.fetch_soup_with_site_fallback(catalog_url, referer=url)
-        chapter_links = self.extract_chapter_links(catalog_url, catalog_soup)
+        if url in {getattr(self._response_state, "requested_url", None), getattr(self._response_state, "response_url", None)}:
+            mime = self._response_state.content_type.split(";", 1)[0].strip().lower()
+            disposition = self._response_state.disposition
+            plain = mime in {"text/plain", "application/txt"}
+            attachment = bool(re.search(r"filename[^;]*\.txt(?:[\"';]|$)", disposition, re.I))
+            if attachment or (plain and not re.search(r"<!doctype\s+html|<html\b|<body\b", self._response_state.text[:2000], re.I)):
+                return self._save_text_content(self._response_state.text, url, title_override)
+        catalog_url, catalog_soup = url, initial_soup
+        visited = {url}
+        discovery_pages = [(url, initial_soup)]
+        chapter_links = []
+        for _ in range(self.MAX_DISCOVERY_PAGES):
+            if self.is_cancelled:
+                raise WebDownloadError("下载已取消。")
+            target = self.resolve_catalog_url(catalog_url, catalog_soup)
+            if target != catalog_url and target not in visited:
+                visited.add(target)
+                self.log(f"正在发现目录：{target}")
+                catalog_url, catalog_soup = self.fetch_soup_with_site_fallback(target, referer=catalog_url)
+                discovery_pages.append((catalog_url, catalog_soup))
+            chapter_links = self.extract_chapter_links(catalog_url, catalog_soup)
+            if chapter_links:
+                break
+            following = self.resolve_catalog_url(catalog_url, catalog_soup)
+            if following == catalog_url or following in visited:
+                break
 
         if not chapter_links:
-            if self._fhxs_book_id(catalog_url):
-                raise WebDownloadError("未找到本书的有效章节目录，未生成 TXT。")
-            chapter_title, content = self.download_generic_chapter(url, title_override)
+            for page_url, page_soup in reversed(discovery_pages):
+                for anchor in page_soup.select("a[href]"):
+                    href = self.parser.link(page_url, anchor.get("href"))
+                    label = self.clean_text(anchor.get_text(" ", strip=True)).lower()
+                    text_download = "txt" in label and bool(re.search(r"下载|全文|download", label))
+                    if href and (urlparse(href).path.lower().endswith(".txt") or anchor.has_attr("download") or text_download) and not self.parser.in_noise(anchor):
+                        return self._download_text_file(href, title_override or self.extract_book_title(initial_soup, url))
+            if self.parser.rules.get("chapter_link_selector") or self.parser.declared_count(catalog_soup):
+                raise WebDownloadError("未匹配到有效章节目录，请检查目录入口和章节链接规则；未生成 TXT。")
+            self.log("未发现完整目录，将尝试保存当前阅读页；可用高级解析规则指定目录。")
+            chapter_title, content = self.download_generic_chapter(catalog_url, title_override)
             if not content:
                 raise WebDownloadError("No readable page content or chapter list was detected.")
-            return self._save_txt(title_override or chapter_title, [(chapter_title, content)], url)
+            return self._save_txt(title_override or chapter_title, [(chapter_title, content)], catalog_url)
 
         book_title = title_override or self.extract_book_title(catalog_soup, catalog_url)
-        if self._fhxs_book_id(catalog_url):
-            declared_count = re.search(r"共\s*(\d+)\s*章", catalog_soup.get_text(" ", strip=True))
-            if declared_count and len(chapter_links) != int(declared_count.group(1)):
-                raise WebDownloadError(f"目录不完整：声明 {declared_count.group(1)} 章，实际找到 {len(chapter_links)} 章。")
+        declared_count = self.parser.declared_count(catalog_soup)
+        if declared_count and len(chapter_links) != declared_count:
+            raise WebDownloadError(f"目录不完整：声明 {declared_count} 章，实际找到 {len(chapter_links)} 章。")
+        self.log(f"通用解析找到 {len(chapter_links)} 个章节，开始下载。")
         chapters = self.download_chapter_batch(chapter_links)
         if not chapters:
             raise WebDownloadError("A chapter list was detected, but every chapter download failed.")
         return self._save_txt(book_title, chapters, catalog_url)
 
     def resolve_catalog_url(self, url: str, soup: BeautifulSoup) -> str:
-        parsed = urlparse(url)
+        target = self.parser.catalog_target(url, soup)
+        if target != url or self.parser.catalog_links(url, soup):
+            return target
+        # 仅在通用发现没有结果时保留旧站点兼容路径。
         book_id = self._fhxs_book_id(url)
         if book_id:
-            # 下载页的 TXT 按钮可能为空，统一回到同一本书的正序目录。
-            return urlunparse(parsed._replace(path=f"/read/{book_id}/", query="", fragment=""))
-        if "/index/" in parsed.path:
-            return url
+            return urlunparse(urlparse(url)._replace(path=f"/read/{book_id}/", query="", fragment=""))
+        return url
 
-        base_host = parsed.hostname or ""
-        candidates = []
-        for anchor in soup.select("a[href]"):
-            href = self.normalize_link(url, anchor.get("href"))
-            if not href or href == url:
-                continue
+    def _download_text_file(self, url, title):
+        text = self.fetch_html(url)
+        return self._save_text_content(text, url, title)
 
-            href_parsed = urlparse(href)
-            if not self.is_same_site(base_host, href_parsed.hostname or ""):
-                continue
+    def _save_text_content(self, text, url, title):
+        if re.search(r"<!doctype\s+html|<html\b|<body\b|<script\b", text[:2000], re.I):
+            raise WebDownloadError("下载地址返回了网页而非 TXT，请使用目录页或配置解析规则。")
+        text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip():
+            raise WebDownloadError("TXT 下载结果为空。")
+        from reader_logic import ReaderLogic
 
-            text = self.clean_text(anchor.get_text(" ", strip=True)).lower()
-            path = href_parsed.path.lower()
-            score = 0
-            if any(keyword in text for keyword in self.CATALOG_TEXT_KEYWORDS):
-                score += 5
-            if "/index/" in path:
-                score += 4
-            if "chapter" in path:
-                score += 1
-            if score >= 4:
-                candidates.append((score, len(path), href))
-
-        if not candidates:
-            return url
-
-        return sorted(candidates, key=lambda item: (-item[0], item[1]))[0][2]
+        lines = text.split("\n")
+        index = ReaderLogic().parse_chapters(text)
+        chapters = []
+        if index:
+            preface = "\n".join(lines[:index[0]["index"]]).strip()
+            if preface:
+                chapters.append(("前言", preface))
+            for position, chapter in enumerate(index):
+                end = index[position + 1]["index"] if position + 1 < len(index) else len(lines)
+                chapters.append((chapter["title"], "\n".join(lines[chapter["index"] + 1:end])))
+        else:
+            chapters.append((title or "正文", text))
+        title = title or Path(unquote(urlparse(url).path)).stem or "网页小说"
+        return self._save_txt(title, chapters, url)
 
     def download_chapter_batch(self, chapter_links: list[ChapterLink]) -> list[tuple[str, str]]:
         max_workers = min(self.MAX_WORKERS, max(1, len(chapter_links)))
@@ -622,8 +660,9 @@ class WebNovelDownloader:
                     continue
                 raise
 
+            url = self._response_base_url(url)
             html = self.resolve_ajax_content(url, html)
-            soup = BeautifulSoup(html, "html.parser")
+            soup = self._soup_from_response(html)
             page_title = self.clean_chapter_title(self.extract_chapter_title(soup))
             content = self.extract_content(soup)
             next_page_url = self.find_next_chapter_page(url, soup)
@@ -717,7 +756,13 @@ class WebNovelDownloader:
                 if not response.encoding or response.encoding.lower() == 'iso-8859-1':
                     response.encoding = response.apparent_encoding or "utf-8"
 
-                return response.text
+                text = response.text
+                self._response_state.requested_url = url
+                self._response_state.response_url = response.url or url
+                self._response_state.content_type = response.headers.get("Content-Type", "")
+                self._response_state.disposition = response.headers.get("Content-Disposition", "")
+                self._response_state.text = text
+                return text
             except requests.exceptions.HTTPError as exc:
                 if exc.response is not None:
                     if exc.response.status_code == 429 and retry_on_429:
@@ -796,7 +841,26 @@ class WebNovelDownloader:
             return html
 
     def fetch_soup(self, url: str, referer: str = "") -> BeautifulSoup:
-        return BeautifulSoup(self.fetch_html(url, referer=referer), "html.parser")
+        return self._soup_from_response(self.fetch_html(url, referer=referer))
+
+    def _response_base_url(self, requested):
+        if getattr(self._response_state, "requested_url", None) == requested:
+            return self._response_state.response_url
+        return requested
+
+    @staticmethod
+    def _soup_from_response(content):
+        if content.lstrip().startswith(("{", "[")):
+            try:
+                json.loads(content)
+                soup = BeautifulSoup("", "html.parser")
+                script = soup.new_tag("script", type="application/json")
+                script.string = content
+                soup.append(script)
+                return soup
+            except ValueError:
+                pass
+        return BeautifulSoup(content, "html.parser")
 
     def fetch_soup_with_site_fallback(
         self,
@@ -804,7 +868,8 @@ class WebNovelDownloader:
         referer: str = "",
     ) -> tuple[str, BeautifulSoup]:
         try:
-            return url, self.fetch_soup(url, referer=referer)
+            soup = self.fetch_soup(url, referer=referer)
+            return self._response_base_url(url), soup
         except (requests.exceptions.RequestException, WebDownloadError):
             parsed = urlparse(url)
             if self.is_cancelled or (parsed.hostname or "").lower() != "www.bikuxs.com":
@@ -813,46 +878,25 @@ class WebNovelDownloader:
         fallback_url = self.replace_bikuxs_host(url, "m.bikuxs.com")
         fallback_referer = self.replace_bikuxs_host(referer, "m.bikuxs.com") if referer else ""
         self.log(f"Desktop catalog failed, retrying mobile page: {fallback_url}")
-        return fallback_url, self.fetch_soup(fallback_url, referer=fallback_referer)
+        soup = self.fetch_soup(fallback_url, referer=fallback_referer)
+        return self._response_base_url(fallback_url), soup
 
     def extract_chapter_links(self, base_url: str, soup: BeautifulSoup) -> list[ChapterLink]:
+        if not self.parser.catalog_links(base_url, soup):
+            return []
         catalog_pages = self.collect_catalog_pages(base_url, soup)
-        parsed_base = urlparse(base_url)
-        base_host = parsed_base.hostname or ""
         candidates: list[ChapterLink] = []
         seen_urls = set()
-        running_index = 0
-        book_id = self._fhxs_book_id(base_url)
 
         for page_url, page_soup in catalog_pages:
-            anchors = page_soup.select("li[chapter-id] a[href]") if book_id else page_soup.select("a[href]")
-            for anchor in anchors:
-                href = self.normalize_link(page_url, anchor.get("href"))
-                if not href or href in seen_urls:
+            entries = self.parser.catalog_links(page_url, page_soup)
+            if not entries:
+                raise WebDownloadError(f"目录分页没有匹配到章节，未生成不完整 TXT：{page_url}")
+            for title, href in entries:
+                if href in seen_urls:
                     continue
-
-                parsed_href = urlparse(href)
-                if not parsed_href.scheme.startswith("http"):
-                    continue
-                if not self.is_same_site(base_host, parsed_href.hostname or ""):
-                    continue
-                if book_id and not re.fullmatch(rf"/read/{book_id}/\d+\.html", parsed_href.path):
-                    continue
-
-                title = self.clean_chapter_title(anchor.get_text(" ", strip=True))
-                if not self.looks_like_chapter_link(title, href):
-                    continue
-
                 seen_urls.add(href)
-                candidates.append(ChapterLink(title=title, url=href, index=running_index))
-                running_index += 1
-
-        if book_id:
-            # 站点目录中存在重复编号、跳号，以实际目录顺序为准。
-            return candidates
-        if len(candidates) < 3:
-            return []
-
+                candidates.append(ChapterLink(self.clean_chapter_title(title), href, len(candidates)))
         return self.sort_chapter_links(candidates)
 
     def collect_catalog_pages(self, start_url: str, start_soup: BeautifulSoup) -> list[tuple[str, BeautifulSoup]]:
@@ -874,12 +918,20 @@ class WebNovelDownloader:
                 raise WebDownloadError(f"目录超过 {self.MAX_CATALOG_PAGES} 页，未生成不完整 TXT。")
             visited.add(next_page_url)
             self.log(f"Loading catalog page: {next_page_url}")
-            current_soup = self.fetch_soup(next_page_url, referer=current_url)
-            current_url = next_page_url
+            resolved_url, current_soup = self.fetch_soup_with_site_fallback(next_page_url, referer=current_url)
+            if resolved_url != next_page_url and resolved_url in visited:
+                raise WebDownloadError(f"目录分页重定向回已访问页面：{resolved_url}")
+            visited.add(resolved_url)
+            current_url = resolved_url
 
         return pages
 
     def find_next_catalog_page(self, current_url: str, soup: BeautifulSoup) -> str:
+        detected = self.parser.next_catalog_page(current_url, soup)
+        if detected:
+            return detected
+        if "catalog_next_selector" in self.parser.rules:
+            return ""
         for anchor in soup.select("a[href]"):
             label = self.clean_text(anchor.get_text(" ", strip=True)).lower()
             if self.is_next_page_label(label):
@@ -902,9 +954,15 @@ class WebNovelDownloader:
         return ""
 
     def find_next_chapter_page(self, current_url: str, soup: BeautifulSoup) -> str:
-        for anchor in soup.select("a[href]"):
-            label = self.clean_text(anchor.get_text(" ", strip=True)).lower()
-            if not self.is_next_page_label(label):
+        if "chapter_next_selector" in self.parser.rules:
+            for node in self.parser.select_rule("chapter_next_selector", soup):
+                target = self.parser.link(current_url, node.get("href"))
+                if target and target != current_url:
+                    return target
+            return ""
+        for anchor in soup.select("a[href], link[rel='next'][href]"):
+            label = self.clean_text(anchor.get("aria-label") or anchor.get_text(" ", strip=True)).lower()
+            if not self.is_next_page_label(label) and "next" not in anchor.get("rel", []):
                 continue
 
             href = self.normalize_link(current_url, anchor.get("href"))
@@ -926,25 +984,7 @@ class WebNovelDownloader:
         return normalized in self.NEXT_PAGE_TEXTS
 
     def is_catalog_pagination_candidate(self, current_url: str, next_url: str) -> bool:
-        current = urlparse(current_url)
-        next_page = urlparse(next_url)
-        if not self.is_same_site(current.hostname or "", next_page.hostname or ""):
-            return False
-        if next_url == current_url or "/chapter/" in next_page.path:
-            return False
-        book_id = self._fhxs_book_id(current_url)
-        if book_id:
-            return bool(re.fullmatch(rf"/read/{book_id}/[01]_\d+\.html", next_page.path))
-
-        current_base = self.base_page_identity(current.path)
-        next_base = self.base_page_identity(next_page.path)
-        if current_base == next_base:
-            return True
-
-        if "index" in next_page.path.lower() or "list" in next_page.path.lower():
-            return True
-
-        return False
+        return self.parser.catalog_pagination_candidate(current_url, next_url)
 
     @staticmethod
     def _fhxs_book_id(url: str) -> str:
@@ -972,7 +1012,9 @@ class WebNovelDownloader:
         path = re.sub(r"/page/\d+$", "/page", path, flags=re.IGNORECASE)
 
         query = parse_qs(parsed.query, keep_blank_values=True)
-        query.pop("page", None)
+        for key in list(query):
+            if key.lower() in NovelPageParser.PAGE_KEYS:
+                query.pop(key)
         stable_query = urlencode(sorted(query.items()), doseq=True)
         return (parsed.hostname or "", path, stable_query)
 
@@ -1027,14 +1069,21 @@ class WebNovelDownloader:
         if not href:
             return ""
         href = href.strip()
-        if href.lower().startswith(("javascript:", "mailto:", "#")):
+        if href.lower().startswith(("javascript:", "mailto:", "#", "data:", "tel:")):
             return ""
-        return self.normalize_url(urldefrag(urljoin(base_url, href)).url)
+        absolute = urldefrag(urljoin(base_url, href)).url
+        if urlparse(absolute).scheme not in {"http", "https"}:
+            return ""
+        return self.normalize_url(absolute)
 
     def is_same_site(self, base_host: str, target_host: str) -> bool:
         if not base_host or not target_host:
             return False
         if base_host == target_host:
+            return True
+        base_root = re.sub(r"^(?:www|m|wap|mobile)\.", "", base_host.lower())
+        target_root = re.sub(r"^(?:www|m|wap|mobile)\.", "", target_host.lower())
+        if base_root == target_root:
             return True
         return target_host.endswith("." + base_host) or base_host.endswith("." + target_host)
 
@@ -1060,21 +1109,20 @@ class WebNovelDownloader:
         return False
 
     def sort_chapter_links(self, links: list[ChapterLink]) -> list[ChapterLink]:
-        numbered = []
-        for link in links:
-            match = re.search(r"\d+", link.title)
-            if match:
-                numbered.append((int(match.group()), link.index, link))
-
         ordered = sorted(links, key=lambda link: link.index)
-        if len(numbered) >= max(3, len(links) // 2):
-            # 通用站点沿用编号排序，但不能因此丢弃序章、尾声等无编号条目。
-            numbered_urls = {item[2].url for item in numbered}
-            sorted_numbered = iter(item[2] for item in sorted(numbered, key=lambda item: (item[0], item[1])))
-            ordered = [next(sorted_numbered) if link.url in numbered_urls else link for link in ordered]
+        numbers = [self.parser.chapter_number(link.title) for link in ordered]
+        known = [number for number in numbers if number is not None]
+        # 只反转明确倒序的目录，不能按编号重排分卷、重复编号或无编号的章节。
+        if len(known) >= 2 and all(left > right for left, right in zip(known, known[1:])):
+            ordered.reverse()
         return [ChapterLink(title=link.title, url=link.url, index=index) for index, link in enumerate(ordered)]
 
     def extract_book_title(self, soup: BeautifulSoup, url: str) -> str:
+        if "book_title_selector" in self.parser.rules:
+            nodes = self.parser.select_rule("book_title_selector", soup)
+            if not nodes:
+                raise WebDownloadError("书名规则没有匹配到节点，请检查 CSS 选择器。")
+            return self.clean_text(nodes[0].get_text(" ", strip=True))
         meta_candidates = [
             ("meta", {"property": "og:title"}),
             ("meta", {"property": "og:novel:book_name"}),
@@ -1127,10 +1175,23 @@ class WebNovelDownloader:
         return ""
 
     def extract_content(self, soup: BeautifulSoup) -> str:
+        if "content_selector" in self.parser.rules:
+            nodes = self.parser.select_rule("content_selector", soup)
+            if not nodes:
+                raise WebDownloadError("正文规则未匹配到节点，请检查 CSS 选择器。")
+            return self.filter_content_lines("\n\n".join(self.score_content_tag(node)[1] for node in nodes))
         candidates = []
         tags = {}
         for selector in self.CONTENT_SELECTORS:
             for tag in soup.select(selector):
+                tags[id(tag)] = tag
+        # 无语义类名的站点改用段落、换行和文本密度识别正文块。
+        for tag in soup.find_all(("div", "section", "td", "pre")):
+            if self.parser.in_noise(tag):
+                continue
+            direct_text = "".join(str(node) for node in tag.find_all(string=True, recursive=False)).strip()
+            if (tag.find("p", recursive=False) or len(tag.find_all("br", recursive=False)) >= 2
+                    or tag.name == "pre" or len(direct_text) >= 80):
                 tags[id(tag)] = tag
         # 有明确正文子容器时不再为外层 main/article 评分，避免菜单和推荐区压过正文。
         ancestors = {id(parent) for tag in tags.values() for parent in tag.parents}
@@ -1141,9 +1202,13 @@ class WebNovelDownloader:
             if score > 0 and text:
                 candidates.append((score, text))
 
+        if not candidates:
+            structured = self.parser.structured_content(soup)
+            if structured:
+                return self.filter_content_lines(self.tag_to_text(BeautifulSoup(structured, "html.parser")))
         if not candidates and soup.body:
             score, text = self.score_content_tag(soup.body)
-            if score > 0 and text:
+            if score > 0 and len(self.clean_text(text)) >= 80:
                 candidates.append((score, text))
 
         if not candidates:
@@ -1155,7 +1220,7 @@ class WebNovelDownloader:
     def score_content_tag(self, tag) -> tuple[int, str]:
         cloned = BeautifulSoup(str(tag), "html.parser")
         for bad in cloned.select(
-            "script, style, nav, header, footer, aside, form, button, noscript, iframe, .ads, .ad, .toolbar, .comment, .recommend, .share"
+            "script, style, nav, header, footer, aside, form, button, noscript, iframe, .ads, .ad, .toolbar, .comment, .recommend, .share, [hidden], [aria-hidden='true']"
         ):
             bad.decompose()
 
@@ -1165,8 +1230,11 @@ class WebNovelDownloader:
 
         paragraphs = len([line for line in text.splitlines() if line.strip()])
         links_text = " ".join(node.get_text(" ", strip=True) for node in cloned.select("a"))
+        if len(links_text) > len(text) * 0.5:
+            return 0, ""
         link_penalty = len(links_text)
-        score = len(text) + paragraphs * 25 - link_penalty
+        punctuation = len(re.findall(r"[。！？；.!?;]", text))
+        score = len(text) + paragraphs * 25 + punctuation * 8 - link_penalty * 3
         return score, text
 
     def tag_to_text(self, tag) -> str:

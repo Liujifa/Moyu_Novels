@@ -314,7 +314,7 @@ class DownloaderBehaviorTests(unittest.TestCase):
         titles = ["序章", "第3章 丙", "第1章 甲", "第2章 乙", "尾声"]
         links = [ChapterLink(t, str(i), i) for i, t in enumerate(titles)]
         self.assertEqual([c.title for c in self.downloader.sort_chapter_links(links)],
-                         ["序章", "第1章 甲", "第2章 乙", "第3章 丙", "尾声"])
+                         titles)
 
     def test_generic_descending_catalog_is_reversed(self):
         links = list(reversed(self.make_links()))

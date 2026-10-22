@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -15,16 +16,18 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 import styles
 from web_novel_downloader import DownloadResult, WebDownloadError, WebNovelDownloader
+from novel_page_parser import EXTRACTION_RULE_FIELDS
 
 
 TRANSLATIONS = {
     "CN": {
         "title": "\u7f51\u9875\u4e0b\u8f7d TXT",
-        "url": "\u5c0f\u8bf4\u76ee\u5f55 / \u9605\u8bfb\u9875 URL",
+        "url": "小说网页 / TXT 地址",
         "name": "\u4e66\u540d\uff08\u53ef\u9009\uff09",
         "browser": "\u5bfc\u5165\u6d4f\u89c8\u5668 Cookie",
         "none": "\u4e0d\u5bfc\u5165",
@@ -35,9 +38,11 @@ TRANSLATIONS = {
         "status_idle": "\u7b49\u5f85\u5f00\u59cb",
         "logs": "下载日志",
         "cancel": "取消下载",
-        "hint": "请输入小说目录页或单章页URL。若遇到 403 Forbidden 错误，请先在常用浏览器中打开该网址并通过验证（如点选“我是人类”），然后在此处选择对应的浏览器导入 Cookie。",
+        "rules": "高级解析规则（可选）",
+        "rules_hint": "留空自动识别。自动解析不准确时，可填写 CSS 选择器指定页面区域；仅用于本次下载。",
+        "hint": "输入小说页面或 TXT 地址，自动识别目录和正文。识别不准确时可展开高级解析规则。遇到 403 时，请先在浏览器确认页面可访问，再导入对应站点 Cookie。",
         "missing_url": "请先输入 URL。",
-        "success": "\u4e0b\u8f7d\u5b8c\u6210\uff0c\u5df2\u81ea\u52a8\u51c6\u5907\u5165\u5e93\u3002",
+        "success": "下载完成，共 {count} 章，已准备入库。",
         "failed": "\u4e0b\u8f7d\u5931\u8d25",
         "progress_web": "\u6b63\u5728\u4e0b\u8f7d\u7f51\u9875\u7ae0\u8282",
         "progress_fanqie": "\u6b63\u5728\u4e0b\u8f7d\u756a\u8304\u7ae0\u8282",
@@ -45,7 +50,7 @@ TRANSLATIONS = {
     },
     "EN": {
         "title": "Download TXT From Web",
-        "url": "Novel Index / Reading URL",
+        "url": "Novel Page / TXT URL",
         "name": "Book Title (Optional)",
         "browser": "Import Browser Cookie",
         "none": "Do Not Import",
@@ -56,9 +61,11 @@ TRANSLATIONS = {
         "status_idle": "Waiting to start",
         "logs": "Download Log",
         "cancel": "Cancel",
-        "hint": "Enter an index or chapter URL. If you get a 403 Forbidden error, visit the site in your browser to pass any challenges, then select that browser here to import cookies.",
+        "rules": "Advanced Extraction Rules (Optional)",
+        "rules_hint": "Leave blank for automatic detection. CSS selectors can specify page regions when needed; rules apply to this download only.",
+        "hint": "Enter a novel page or TXT URL for automatic extraction. Advanced rules can specify page regions when needed. For a 403 response, confirm browser access and import the site's cookies.",
         "missing_url": "Please enter a URL first.",
-        "success": "Download completed and is ready to import into the library.",
+        "success": "Downloaded {count} chapters and ready to import into the library.",
         "failed": "Download Failed",
         "progress_web": "Downloading web chapters",
         "progress_fanqie": "Downloading Fanqie chapters",
@@ -73,13 +80,14 @@ class DownloadWorker(QObject):
     finished = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, url: str, title: str, browser: str, download_dir: str, language: str = "CN"):
+    def __init__(self, url: str, title: str, browser: str, download_dir: str, language: str = "CN", extraction_rules=None):
         super().__init__()
         self.url = url
         self.title = title
         self.browser = browser
         self.download_dir = download_dir
         self.language = language
+        self.extraction_rules = dict(extraction_rules or {})
         self.downloader = None
         self._abort_requested = False
 
@@ -90,6 +98,7 @@ class DownloadWorker(QObject):
                 progress_callback=self.progress.emit,
                 log_callback=self.log.emit,
                 language=self.language,
+                extraction_rules=self.extraction_rules,
             )
             self.downloader.is_cancelled = self._abort_requested
             result = self.downloader.download(self.url, self.title, self.browser)
@@ -155,6 +164,26 @@ class WebDownloadDialog(QDialog):
         form.addRow(self.t("browser"), self.browser_combo)
         layout.addLayout(form)
 
+        self.rules_group = QGroupBox(self.t("rules"))
+        self.rules_group.setCheckable(True)
+        self.rules_group.setChecked(False)
+        rules_layout = QVBoxLayout(self.rules_group)
+        self.rules_body = QWidget()
+        rules_form = QFormLayout(self.rules_body)
+        rules_hint = QLabel(self.t("rules_hint"))
+        rules_hint.setWordWrap(True)
+        rules_form.addRow(rules_hint)
+        self.rule_inputs = {}
+        for key, chinese_label, english_label, example in EXTRACTION_RULE_FIELDS:
+            field = QLineEdit()
+            field.setPlaceholderText(example)
+            self.rule_inputs[key] = field
+            rules_form.addRow(chinese_label if self.language == "CN" else english_label, field)
+        rules_layout.addWidget(self.rules_body)
+        self.rules_group.toggled.connect(self.rules_body.setVisible)
+        self.rules_body.hide()
+        layout.addWidget(self.rules_group)
+
         help_row = QHBoxLayout()
         self.help_btn = QPushButton(self.t("how_to_export"))
         self.help_btn.setFlat(True)
@@ -207,6 +236,7 @@ class WebDownloadDialog(QDialog):
         self.url_input.setEnabled(False)
         self.title_input.setEnabled(False)
         self.browser_combo.setEnabled(False)
+        self.rules_group.setEnabled(False)
 
         browser = self.browser_combo.currentData()
         if browser == "file":
@@ -220,6 +250,7 @@ class WebDownloadDialog(QDialog):
                 self.url_input.setEnabled(True)
                 self.title_input.setEnabled(True)
                 self.browser_combo.setEnabled(True)
+                self.rules_group.setEnabled(True)
                 return
             browser = file_path # Pass the path as the "browser" param
 
@@ -230,6 +261,8 @@ class WebDownloadDialog(QDialog):
             browser=browser,
             download_dir=self.download_dir,
             language=self.language,
+            extraction_rules={key: field.text().strip() for key, field in self.rule_inputs.items()
+                              if self.rules_group.isChecked() and field.text().strip()},
         )
         self.worker.moveToThread(self.thread)
 
@@ -283,10 +316,11 @@ class WebDownloadDialog(QDialog):
             return
         self.result_data = payload
         self.progress_bar.setValue(100)
-        self.status_label.setText(self.t("success"))
+        success = self.t("success").format(count=payload["chapter_count"])
+        self.status_label.setText(success)
         self.append_log(payload["file_path"])
         self.btn_close.setText(self.t("close"))
-        QMessageBox.information(self, self.t("title"), self.t("success"))
+        QMessageBox.information(self, self.t("title"), success)
         self.accept()
 
     def show_download_error(self, message: str):
@@ -300,6 +334,7 @@ class WebDownloadDialog(QDialog):
         self.url_input.setEnabled(True)
         self.title_input.setEnabled(True)
         self.browser_combo.setEnabled(True)
+        self.rules_group.setEnabled(True)
 
     def show_export_help(self):
         guide_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie_export_guide.md")

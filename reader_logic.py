@@ -104,6 +104,8 @@ class ReaderLogic:
         stripped = line.strip()
         if not stripped or len(stripped) > 80:
             return False
+        if stripped.startswith("正文") and stripped != "正文" and not re.match(r"^正文[\s：:—-]", stripped):
+            return False
 
         return any(pattern.match(stripped) for pattern in self.chapter_patterns)
 
