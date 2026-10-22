@@ -8,5 +8,9 @@ test_downloads/
 temp_dl/
 .venv/
 venv/
+.venv-build/
+build/
+dist/
+release-artifacts/
 /cookies*.txt
 /cookies*.json

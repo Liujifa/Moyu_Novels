@@ -1,0 +1,20 @@
+# Windows x64 / Python 3.13 发布环境的完整版本锁定。
+altgraph==0.17.5
+beautifulsoup4==4.14.3
+certifi==2026.10.19
+chardet==5.2.0
+charset-normalizer==3.5.2
+idna==3.20
+packaging==26.3
+pefile==2024.8.26
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+PyQt6==6.10.2
+PyQt6-Qt6==6.10.2
+PyQt6_sip==13.13.0
+pywin32-ctypes==0.2.3
+requests==2.32.5
+setuptools==84.2.1
+soupsieve==3.0.4
+typing_extensions==4.16.0
+urllib3==2.8.0

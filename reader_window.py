@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QPushButton,
+    QSizeGrip,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -61,7 +62,8 @@ class ReaderWindow(QMainWindow):
         self._last_save_error = None
 
         self.setWindowTitle("MoYu Reader")
-        self.setMinimumSize(420, 620)
+        self.setMinimumSize(520, 360)
+        self.resize(640, 740)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
@@ -118,6 +120,8 @@ class ReaderWindow(QMainWindow):
         self.header_layout.addWidget(self.btn_mode)
 
         self.btn_close = QPushButton()
+        self.btn_close.setObjectName("CloseButton")
+        self.btn_close.setStyleSheet("padding: 0; font-size: 16px;")
         self.btn_close.setFixedSize(28, 28)
         self.btn_close.clicked.connect(self.hide)
         self.header_layout.addWidget(self.btn_close)
@@ -133,6 +137,12 @@ class ReaderWindow(QMainWindow):
         self.opacity_effect = QGraphicsOpacityEffect(self.reader_area)
         self.reader_area.setGraphicsEffect(self.opacity_effect)
         self.layout.addWidget(self.reader_area)
+
+        self.resize_grip = QSizeGrip(self)
+        self.resize_grip.setToolTip("拖动调整窗口大小 / Resize")
+        self.layout.addWidget(self.resize_grip, 0, Qt.AlignmentFlag.AlignRight)
+        self.btn_close.setToolTip("隐藏阅读窗口 / Hide reader")
+        self.header_frame.setToolTip("拖动顶部区域移动窗口 / Drag to move")
 
         self.setStyleSheet(styles.READER_QSS)
         self.retranslate_ui()
@@ -161,12 +171,14 @@ class ReaderWindow(QMainWindow):
 
         if self.settings.get("reading_mode"):
             self.header_frame.hide()
+            self.resize_grip.hide()
             self.reader_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.central_widget.setStyleSheet(
                 "QWidget#CentralWidget { background-color: rgba(0, 0, 0, 0.01); border: none; }"
             )
         else:
             self.header_frame.show()
+            self.resize_grip.show()
             self.reader_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             self.central_widget.setStyleSheet("")
 

@@ -1,6 +1,5 @@
 # main.py
 import sys
-from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QIcon
@@ -11,17 +10,22 @@ from library_view import LibraryView
 from download_dialog import WebDownloadDialog
 from reader_logic import ReaderLogic
 from reader_window import ReaderWindow
+from app_paths import APP_VERSION, data_directory, resource_path
 
 
 class MoYuApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
+        self.app.setApplicationName("MoYu Reader")
+        self.app.setApplicationVersion(APP_VERSION)
+        self.app.setWindowIcon(QIcon(str(resource_path("assets/moyu.ico"))))
+        self.app.setStyle("Fusion")
         self.app.setQuitOnLastWindowClosed(False)
         self._quitting = False
         self._shutdown_pending = set()
 
         try:
-            self.manager = LibraryManager(str(Path(__file__).resolve().with_name("library.json")))
+            self.manager = LibraryManager(str(data_directory() / "library.json"))
         except (OSError, ValueError) as exc:
             QMessageBox.critical(None, "无法读取书库", str(exc))
             raise SystemExit(1) from exc
@@ -32,18 +36,15 @@ class MoYuApp:
 
         self.main_win = QMainWindow()
         self.main_win.setCentralWidget(self.library_win)
-        self.main_win.setWindowTitle("MoYu Library")
-        self.main_win.resize(460, 560)
+        self.main_win.setWindowTitle(f"MoYu Reader · 摸鱼看小说 {APP_VERSION}")
+        self.main_win.setMinimumSize(860, 620)
+        self.main_win.resize(1080, 760)
+        available = self.app.primaryScreen().availableGeometry()
+        self.main_win.resize(min(1080, available.width()), min(760, available.height()))
 
         self.setup_tray()
         self.setup_connections()
-        self.show_first_run_message()
-
-        self.tray_icon.showMessage(
-            "MoYu Reader",
-            "Running in background",
-            QSystemTrayIcon.MessageIcon.Information,
-        )
+        self.main_win.show()
 
     def show_first_run_message(self):
         settings = self.manager.get_settings()
@@ -71,7 +72,7 @@ class MoYuApp:
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self.app)
 
-        icon = QIcon.fromTheme("document-open")
+        icon = QIcon(str(resource_path("assets/moyu.ico")))
         if icon.isNull():
             from PyQt6.QtGui import QColor, QPainter, QPixmap
 
@@ -86,13 +87,13 @@ class MoYuApp:
         self.tray_icon.setIcon(icon)
 
         menu = QMenu()
-        show_lib_action = QAction("Library", self.app)
+        show_lib_action = QAction("打开书库 / Library", self.app)
         show_lib_action.triggered.connect(self.main_win.show)
 
-        show_reader_action = QAction("Reader", self.app)
+        show_reader_action = QAction("返回阅读 / Reader", self.app)
         show_reader_action.triggered.connect(self.reader_win.show)
 
-        quit_action = QAction("Quit", self.app)
+        quit_action = QAction("退出 / Quit", self.app)
         quit_action.triggered.connect(self.quit_app)
 
         menu.addAction(show_lib_action)
@@ -150,5 +151,10 @@ class MoYuApp:
 
 
 if __name__ == "__main__":
-    app = MoYuApp()
-    app.run()
+    if len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
+        from release_smoke import run
+
+        sys.exit(run(sys.argv[2]))
+    else:
+        app = MoYuApp()
+        app.run()

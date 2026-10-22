@@ -1,7 +1,7 @@
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon
 from PyQt6.QtWidgets import (
     QCheckBox,
     QColorDialog,
@@ -10,9 +10,11 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QTextEdit,
     QVBoxLayout,
@@ -21,6 +23,7 @@ from PyQt6.QtWidgets import (
 
 import styles
 from download_dialog import WebDownloadDialog
+from app_paths import APP_VERSION, data_directory, resource_path
 
 
 TRANSLATIONS = {
@@ -70,6 +73,21 @@ TRANSLATIONS = {
     },
 }
 
+TRANSLATIONS["CN"].update({
+    "tagline": "把片刻空闲，留给好故事。", "search": "搜索书名…",
+    "count": "{count} 本藏书", "empty": "你的下一段故事，从这里开始",
+    "empty_hint": "导入本地 TXT，或从网页下载小说。", "no_matches": "没有找到匹配的书籍",
+    "choose": "选择一本书，继续阅读", "choose_hint": "阅读进度会自动保存。",
+    "chapter_hint": "手动选择章节后，点击开始阅读即可跳转。", "data_folder": "打开数据目录",
+})
+TRANSLATIONS["EN"].update({
+    "tagline": "A little time. A good story.", "search": "Search your library…",
+    "count": "{count} books", "empty": "Your next story starts here",
+    "empty_hint": "Import a local TXT or download a novel from the web.", "no_matches": "No matching books",
+    "choose": "Choose a book to continue", "choose_hint": "Your reading position is saved automatically.",
+    "chapter_hint": "Select a chapter, then start reading to jump there.", "data_folder": "Open data folder",
+})
+
 
 class LibraryView(QWidget):
     novel_selected = pyqtSignal(dict, int)
@@ -88,9 +106,25 @@ class LibraryView(QWidget):
     def init_ui(self):
         self.setStyleSheet(styles.LIBRARY_QSS)
 
-        self.main_layout = QHBoxLayout(self)
-        self.main_layout.setContentsMargins(18, 18, 18, 18)
-        self.main_layout.setSpacing(16)
+        self.root_layout = QVBoxLayout(self)
+        self.root_layout.setContentsMargins(28, 24, 28, 18)
+        self.root_layout.setSpacing(18)
+        header = QHBoxLayout()
+        brand = QLabel("MoYu Reader")
+        brand.setObjectName("BrandTitle")
+        header.addWidget(brand)
+        header.addStretch()
+        version = QLabel(f"v{APP_VERSION}  /  TXT & WEB")
+        version.setObjectName("Badge")
+        header.addWidget(version)
+        self.root_layout.addLayout(header)
+        self.tagline_label = QLabel(self.t("tagline"))
+        self.tagline_label.setObjectName("Subtitle")
+        self.root_layout.addWidget(self.tagline_label)
+
+        self.main_layout = QHBoxLayout()
+        self.main_layout.setSpacing(20)
+        self.root_layout.addLayout(self.main_layout, 1)
 
         self.left_layout = QVBoxLayout()
         self.left_layout.setSpacing(16)
@@ -98,41 +132,72 @@ class LibraryView(QWidget):
         self.lib_layout = QVBoxLayout(self.lib_group)
         self.lib_layout.setSpacing(12)
 
+        library_header = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText(self.t("search"))
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.filter_library)
+        library_header.addWidget(self.search_input, 1)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("Badge")
+        library_header.addWidget(self.count_label)
+        self.lib_layout.addLayout(library_header)
+
+        import_row = QHBoxLayout()
+        self.btn_add = QPushButton(self.t("add_novel"))
+        self.btn_add.clicked.connect(self.on_add_novel)
+        import_row.addWidget(self.btn_add)
+        self.btn_download = QPushButton(self.t("download_web"))
+        self.btn_download.clicked.connect(self.on_download_web)
+        import_row.addWidget(self.btn_download)
+        self.lib_layout.addLayout(import_row)
+
         self.novel_list = QListWidget()
-        self.novel_list.setAlternatingRowColors(True)
+        self.novel_list.setSpacing(5)
         self.novel_list.itemDoubleClicked.connect(lambda _item: self.on_read_selected())
-        self.lib_layout.addWidget(self.novel_list)
+        self.lib_layout.addWidget(self.novel_list, 1)
+
+        self.empty_label = QLabel()
+        self.empty_label.setObjectName("EmptyState")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lib_layout.addWidget(self.empty_label, 1)
 
         self.btn_layout = QHBoxLayout()
         self.btn_layout.setSpacing(10)
 
-        self.btn_add = QPushButton(self.t("add_novel"))
-        self.btn_add.clicked.connect(self.on_add_novel)
-        self.btn_layout.addWidget(self.btn_add)
-
         self.btn_delete = QPushButton(self.t("delete_novel"))
+        self.btn_delete.setObjectName("DangerButton")
         self.btn_delete.clicked.connect(self.on_delete_selected)
         self.btn_layout.addWidget(self.btn_delete)
 
-        self.btn_download = QPushButton(self.t("download_web"))
-        self.btn_download.clicked.connect(self.on_download_web)
-        self.btn_layout.addWidget(self.btn_download)
-
         self.btn_read = QPushButton(self.t("start_reading"))
+        self.btn_read.setObjectName("PrimaryButton")
         self.btn_read.clicked.connect(self.on_read_selected)
         self.btn_layout.addWidget(self.btn_read)
 
         self.lib_layout.addLayout(self.btn_layout)
         self.left_layout.addWidget(self.lib_group)
-        self.main_layout.addLayout(self.left_layout, 1)
+        self.main_layout.addLayout(self.left_layout, 3)
 
-        self.right_layout = QVBoxLayout()
+        self.sidebar = QWidget()
+        self.sidebar.setObjectName("Sidebar")
+        self.sidebar.setMinimumWidth(310)
+        self.right_layout = QVBoxLayout(self.sidebar)
+        self.right_layout.setContentsMargins(0, 0, 8, 0)
         self.right_layout.setSpacing(16)
 
         self.chapter_group = QGroupBox(self.t("chapter_select"))
         self.chapter_layout = QVBoxLayout(self.chapter_group)
         self.chapter_layout.setSpacing(10)
+        self.selected_title = QLabel(self.t("choose"))
+        self.selected_title.setObjectName("SelectedTitle")
+        self.selected_title.setWordWrap(True)
+        self.chapter_layout.addWidget(self.selected_title)
         self.chapter_combo = QComboBox()
+        self.chapter_combo.setMaxVisibleItems(16)
+        self.chapter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.chapter_combo.setMinimumContentsLength(12)
         self.chapter_combo.currentIndexChanged.connect(self.on_chapter_changed)
         self.chapter_combo.activated.connect(self.on_chapter_changed)
         self.chapter_layout.addWidget(self.chapter_combo)
@@ -140,6 +205,10 @@ class LibraryView(QWidget):
         self.progress_label = QLabel()
         self.progress_label.setWordWrap(True)
         self.chapter_layout.addWidget(self.progress_label)
+        self.chapter_hint = QLabel(self.t("chapter_hint"))
+        self.chapter_hint.setObjectName("Muted")
+        self.chapter_hint.setWordWrap(True)
+        self.chapter_layout.addWidget(self.chapter_hint)
         self.right_layout.addWidget(self.chapter_group)
 
         self.settings_group = QGroupBox(self.t("settings"))
@@ -180,15 +249,35 @@ class LibraryView(QWidget):
         self.preview_group = QGroupBox(self.t("preview_title"))
         self.preview_layout = QVBoxLayout(self.preview_group)
         self.preview_box = QTextEdit()
+        self.preview_box.setMinimumHeight(150)
+        self.preview_box.setMaximumHeight(200)
         self.preview_box.setReadOnly(True)
         self.preview_box.setPlainText(self.t("preview_text"))
         self.preview_layout.addWidget(self.preview_box)
         self.right_layout.addWidget(self.preview_group)
 
-        self.main_layout.addLayout(self.right_layout, 1)
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("SidebarScroll")
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setWidget(self.sidebar)
+        self.sidebar_scroll.setMinimumWidth(338)
+        self.main_layout.addWidget(self.sidebar_scroll, 2)
+
+        footer = QHBoxLayout()
+        self.footer_hint = QLabel(self.t("choose_hint"))
+        self.footer_hint.setObjectName("Muted")
+        footer.addWidget(self.footer_hint)
+        footer.addStretch()
+        self.btn_data = QPushButton(self.t("data_folder"))
+        self.btn_data.setObjectName("QuietButton")
+        self.btn_data.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(data_directory()))))
+        footer.addWidget(self.btn_data)
+        self.root_layout.addLayout(footer)
 
         self.refresh_library()
         self.apply_preview_settings()
+        self.update_selection_state()
         self.update_progress_label()
 
     def t(self, key):
@@ -211,13 +300,20 @@ class LibraryView(QWidget):
         self.btn_read.setText(self.t("start_reading"))
         self.chapter_group.setTitle(self.t("chapter_select"))
         self.settings_group.setTitle(self.t("settings"))
-        self.fs_label.setText(self.t("font_size"))
-        self.to_label.setText(self.t("text_opacity"))
+        self.fs_label.setText(f"{self.t('font_size')} · {self.fs_slider.value()} pt")
+        self.to_label.setText(f"{self.t('text_opacity')} · {self.to_slider.value()}%")
         self.btn_color.setText(self.t("change_color"))
         self.rm_check.setText(self.t("stealth_mode"))
         self.btn_lang.setText(self.t("lang_toggle"))
         self.preview_group.setTitle(self.t("preview_title"))
         self.preview_box.setPlainText(self.t("preview_text"))
+        self.tagline_label.setText(self.t("tagline"))
+        self.search_input.setPlaceholderText(self.t("search"))
+        self.chapter_hint.setText(self.t("chapter_hint"))
+        self.footer_hint.setText(self.t("choose_hint"))
+        self.btn_data.setText(self.t("data_folder"))
+        self.filter_library()
+        self.update_selection_state()
         self.update_progress_label()
 
     def refresh_library(self):
@@ -230,8 +326,35 @@ class LibraryView(QWidget):
         for item in self.manager.data["library"]:
             self.novel_list.addItem(item["title"])
             self.novel_list.item(self.novel_list.count() - 1).setData(Qt.ItemDataRole.UserRole, item["path"])
+            self.novel_list.item(self.novel_list.count() - 1).setToolTip(item["path"])
+            self.novel_list.item(self.novel_list.count() - 1).setIcon(QIcon(str(resource_path("assets/moyu.ico"))))
 
         self.novel_list.itemSelectionChanged.connect(self.on_novel_selection_changed)
+        self.filter_library()
+        self.update_selection_state()
+
+    def filter_library(self, *_):
+        query = self.search_input.text().strip().casefold()
+        visible = 0
+        for index in range(self.novel_list.count()):
+            item = self.novel_list.item(index)
+            hidden = query not in item.text().casefold()
+            item.setHidden(hidden)
+            visible += int(not hidden)
+        # 隐藏的选中项不能继续触发“开始阅读”，避免搜索后误开另一本书。
+        if any(item.isHidden() for item in self.novel_list.selectedItems()):
+            self.novel_list.clearSelection()
+        self.count_label.setText(self.t("count").format(count=self.novel_list.count()))
+        self.novel_list.setVisible(visible > 0)
+        self.empty_label.setVisible(visible == 0)
+        self.empty_label.setText(self.t("no_matches") if query else self.t("empty") + "\n\n" + self.t("empty_hint"))
+
+    def update_selection_state(self):
+        novel = self.get_selected_novel()
+        self.btn_read.setEnabled(novel is not None)
+        self.btn_delete.setEnabled(novel is not None)
+        self.chapter_combo.setEnabled(bool(novel and self.current_chapters))
+        self.selected_title.setText(novel["title"] if novel else self.t("choose"))
 
     def current_chapter_index_for_pos(self, pos):
         if not self.current_chapters:
@@ -276,7 +399,7 @@ class LibraryView(QWidget):
 
     def get_selected_novel(self):
         selected = self.novel_list.selectedItems()
-        if not selected:
+        if not selected or selected[0].isHidden():
             return None
 
         path = selected[0].data(Qt.ItemDataRole.UserRole)
@@ -289,6 +412,8 @@ class LibraryView(QWidget):
         for index in range(self.novel_list.count()):
             item = self.novel_list.item(index)
             if item.text() == title:
+                if item.isHidden():
+                    self.search_input.clear()
                 self.novel_list.setCurrentItem(item)
                 self.on_novel_selection_changed()
                 break
@@ -297,6 +422,8 @@ class LibraryView(QWidget):
         for index in range(self.novel_list.count()):
             item = self.novel_list.item(index)
             if item.data(Qt.ItemDataRole.UserRole) == path:
+                if item.isHidden():
+                    self.search_input.clear()
                 self.novel_list.setCurrentItem(item)
                 self.on_novel_selection_changed()
                 break
@@ -309,6 +436,7 @@ class LibraryView(QWidget):
             self.pending_chapter_pos = None
             self.chapter_combo.clear()
             self.update_progress_label(0)
+            self.update_selection_state()
             return
 
         self.current_novel_path = novel["path"]
@@ -322,6 +450,7 @@ class LibraryView(QWidget):
         self.chapter_combo.blockSignals(False)
 
         self.sync_combo_to_progress(novel.get("last_pos", 0))
+        self.update_selection_state()
 
     def on_chapter_changed(self, index):
         if index >= 0 and self.current_chapters:
@@ -461,6 +590,8 @@ class LibraryView(QWidget):
         color = QColor(s["font_color"])
         r, g, b = color.red(), color.green(), color.blue()
         a = s["text_opacity"]
+        self.fs_label.setText(f"{self.t('font_size')} · {s['font_size']} pt")
+        self.to_label.setText(f"{self.t('text_opacity')} · {round(a * 100)}%")
 
         self.preview_box.setStyleSheet(f"""
             QTextEdit {{

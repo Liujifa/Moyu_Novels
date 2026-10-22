@@ -4,6 +4,10 @@
 
 使用 **Python 3.9+ · PyQt6 · Requests · BeautifulSoup4 · Chardet** 构建。
 
+**直接使用：** [下载 Windows 64 位免安装包](https://github.com/Liujifa/Mess-Around/releases/latest)。无需安装 Python，完整解压后双击 `MoYuReader.exe`。
+
+![MoYu Reader 书库界面](docs/images/library.png)
+
 [快速开始](#快速开始) · [阅读指南](#阅读指南) · [网页下载](#网页下载) · [数据与备份](#数据与备份) · [常见问题](#常见问题) · [开发与测试](#开发与测试)
 
 ## 功能一览
@@ -21,16 +25,24 @@
 
 ## 快速开始
 
-### 方式一：Windows 一键启动
+### 方式一：下载免安装包（推荐）
+
+1. 打开 [Releases](https://github.com/Liujifa/Mess-Around/releases/latest)，下载 `MoYuReader-v1.0.0-Windows-x64.zip`。
+2. 完整解压 ZIP 到本地目录，双击 `MoYuReader.exe`。请保留旁边的 `_internal` 文件夹，不要在压缩软件内部运行。
+3. 启动后直接显示书库。导入 TXT 或从网页下载，选择章节后点击 **开始阅读**。
+
+适用于 **Windows 10 / 11，64 位**。发布包附带 SHA-256 校验文件和第三方组件许可证；GitHub 自动生成的 `Source code` 压缩包是源码，不含可直接运行的 EXE。
+
+### 方式二：Windows 源码一键启动
 
 1. [下载项目 ZIP](https://github.com/Liujifa/Mess-Around/archive/refs/heads/main.zip)，并解压到可写的目录。
 2. 安装 **Python 3.9 或更高版本**，安装时启用 **Add Python to PATH**。
 3. 双击 `StartReader.bat`。脚本会检查 Python、pip 和所需依赖，缺少依赖时尝试安装。
-4. 程序启动后常驻系统托盘。**双击托盘图标**，或右键选择 **Library**，打开书库。
+4. 程序启动后显示书库，并常驻系统托盘。关闭书库后，可**双击托盘图标**，或右键选择 **打开书库 / Library**，重新打开。
 
-首次安装依赖需要联网。主窗口默认不自动弹出；没有看到窗口时，请先检查任务栏的托盘隐藏图标区域。
+首次安装依赖需要联网。关闭书库后程序仍在托盘运行；完全退出请选择托盘菜单中的 **退出 / Quit**。
 
-### 方式二：从源码运行
+### 方式三：从源码运行
 
 ```powershell
 git clone https://github.com/Liujifa/Mess-Around.git
@@ -50,6 +62,8 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 5. 透明模式会隐藏顶部工具栏。需要恢复普通模式时，从托盘打开 **Library**，取消勾选 **阅读模式**。
 
 书库右侧可以调整文字颜色和透明度，并查看预览。阅读窗口顶部的 **X** 会隐藏阅读窗口；要完全退出，请右键托盘图标选择 **Quit**。
+
+书库支持按书名搜索，设置旁会显示当前字号和透明度。无选中书籍时阅读和删除按钮自动禁用。右侧设置区与下载表单支持滚动，展开高级规则后操作按钮仍固定在窗口底部。普通阅读模式可拖动顶部区域移动窗口，拖动右下角调整大小。
 
 ## 网页下载
 
@@ -108,13 +122,17 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 
 | 文件或目录 | 用途 |
 | --- | --- |
-| `library.json` | 程序目录下的个人书库、阅读进度与全局设置；首次保存时创建 |
+| `library.json` | 数据目录中的个人书库、阅读进度与全局设置；首次保存时创建 |
 | `novel_downloads/*.txt` | 网页下载生成的小说正文 |
 | `小说名.txt.chapters.json` | 对应 TXT 的章节标题、行号与 SHA-256 校验信息 |
 | `novel_downloads/.chapter_cache/` | 尚未完成下载的章节缓存，可以删除后重新抓取 |
 | `charset.json` | 部分网页正文的字符解码配置 |
 
 建议在退出软件后备份 `library.json` 和小说文件；移动下载 TXT 时一起移动对应的 `.chapters.json`。
+
+**数据目录：** 免安装 EXE 使用 `%LOCALAPPDATA%\MoYuReader`；源码运行继续使用项目目录，兼容已有书库。点击书库底部的 **打开数据目录** 可直接访问。升级时替换程序文件不会覆盖独立保存的用户数据。开发和自检可通过环境变量 `MOYU_DATA_DIR` 指定独立数据目录。
+
+从源码版迁移到 EXE 时，先退出两个版本，再复制原 `library.json` 和 `novel_downloads` 到新数据目录。本地 TXT 请保留原路径；书库中的绝对路径不会自动改写，原小说位置改变时需要重新导入。
 
 **书库记录的是文件路径。** 单独移动小说后，旧书库条目可能失效，需要重新导入；不会自动迁移旧条目的阅读进度。删除书库条目只移除记录，不删除原始 TXT。
 
@@ -158,8 +176,30 @@ python -m unittest discover -v
 - 下载线程取消、重试与托盘安全退出；
 - 书库原子保存、磁盘故障回滚、旧数据兼容与损坏文件保护；
 - 文档复用、目录动作释放和读取失败后的状态保留。
+- 书库搜索、空状态、语言切换后的手动选章、短窗口表单滚动，以及发布版数据目录隔离。
 
-其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖审查中发现的异常路径，`test_generic_downloader.py` 覆盖通用解析与下载规则。
+其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖审查中发现的异常路径，`test_generic_downloader.py` 覆盖通用解析与下载规则，`test_ui_release.py` 覆盖界面与发布路径。
+
+### 构建 Windows 发布包
+
+在 Windows x64 / Python 3.13 环境运行：
+
+```powershell
+python -m venv .venv-build
+.\.venv-build\Scripts\python.exe -m pip install -r requirements-build.txt
+.\.venv-build\Scripts\python.exe -m unittest discover -v
+.\.venv-build\Scripts\python.exe build_release.py
+```
+
+产物位于 `release-artifacts/`，包括 ZIP 与 `SHA256SUMS.txt`。`MoYuReader.spec` 只收集明确指定的资源，不打包个人书库、小说或 Cookie；`requirements-build.txt` 锁定发布依赖。
+
+解压产物后可运行自检：
+
+```powershell
+.\MoYuReader\MoYuReader.exe --smoke-test C:\Temp\MoYuSmoke
+```
+
+自检使用临时数据和本地 HTTP 服务，验证窗口、章节跳转、下载、索引与保存，并在指定目录输出截图及 `smoke-result.json`；不会联网下载小说或修改个人书库。发布版的界面截图、检查结果和构建步骤见 [发布说明](packaging/README.md)。
 
 ### 在线目录检查
 
@@ -185,6 +225,8 @@ python test_bqg5.py https://example.com/novel/catalog --chapter-links ".chapters
 | `novel_page_parser.py` | 通用目录发现、链接分组、分页识别、结构化数据与 CSS 规则 |
 | `browser_cookie_importer.py` | 浏览器与文件 Cookie 导入 |
 | `styles.py` | 书库和阅读器样式 |
+| `app_paths.py` | 应用版本、只读资源和可写数据目录 |
+| `build_release.py` / `MoYuReader.spec` | Windows EXE 构建、许可证收集、ZIP 与校验文件 |
 
 ## 许可与内容
 

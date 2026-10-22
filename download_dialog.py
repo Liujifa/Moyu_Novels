@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
 import styles
 from web_novel_downloader import DownloadResult, WebDownloadError, WebNovelDownloader
 from novel_page_parser import EXTRACTION_RULE_FIELDS
+from app_paths import data_directory, resource_path
 
 
 TRANSLATIONS = {
@@ -129,7 +131,7 @@ class WebDownloadDialog(QDialog):
         self._cancel_requested = False
         self._pending_result = None
         self._pending_error = None
-        self.download_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "novel_downloads")
+        self.download_dir = str(data_directory() / "novel_downloads")
         self.init_ui()
 
     def t(self, key: str) -> str:
@@ -138,10 +140,26 @@ class WebDownloadDialog(QDialog):
     def init_ui(self):
         self.setWindowTitle(self.t("title"))
         self.setMinimumWidth(620)
+        self.setMinimumHeight(480)
+        self.resize(700, 680)
         self.setStyleSheet(styles.LIBRARY_QSS)
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setObjectName("SidebarScroll")
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        self.content_scroll.setWidget(content)
+        outer_layout.addWidget(self.content_scroll, 1)
         layout.setSpacing(12)
+        layout.setContentsMargins(24, 22, 24, 22)
+
+        heading = QLabel(self.t("title"))
+        heading.setObjectName("PageTitle")
+        layout.addWidget(heading)
 
         hint = QLabel(self.t("hint"))
         hint.setWordWrap(True)
@@ -151,7 +169,10 @@ class WebDownloadDialog(QDialog):
         form.setSpacing(10)
 
         self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://…")
+        self.url_input.setClearButtonEnabled(True)
         self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("自动识别书名" if self.language == "CN" else "Detect automatically")
         self.browser_combo = QComboBox()
         self.browser_combo.addItem(self.t("none"), "none")
         self.browser_combo.addItem("Edge", "edge")
@@ -187,8 +208,8 @@ class WebDownloadDialog(QDialog):
         help_row = QHBoxLayout()
         self.help_btn = QPushButton(self.t("how_to_export"))
         self.help_btn.setFlat(True)
+        self.help_btn.setObjectName("QuietButton")
         self.help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.help_btn.setStyleSheet("color: #4CAF50; text-decoration: underline; text-align: left; font-size: 11px;")
         self.help_btn.clicked.connect(self.show_export_help)
         help_row.addWidget(self.help_btn)
         help_row.addStretch()
@@ -204,19 +225,22 @@ class WebDownloadDialog(QDialog):
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_box.setMinimumHeight(100)
         self.log_box.setMaximumBlockCount(1000)
         self.log_box.setPlaceholderText(self.t("logs"))
         layout.addWidget(self.log_box)
 
         button_row = QHBoxLayout()
+        button_row.setContentsMargins(24, 0, 24, 20)
         self.btn_download = QPushButton(self.t("download"))
+        self.btn_download.setObjectName("PrimaryButton")
         self.btn_download.clicked.connect(self.start_download)
         button_row.addWidget(self.btn_download)
 
         self.btn_close = QPushButton(self.t("close"))
         self.btn_close.clicked.connect(self.reject)
         button_row.addWidget(self.btn_close)
-        layout.addLayout(button_row)
+        outer_layout.addLayout(button_row)
 
     def start_download(self):
         url = self.url_input.text().strip()
@@ -337,7 +361,7 @@ class WebDownloadDialog(QDialog):
         self.rules_group.setEnabled(True)
 
     def show_export_help(self):
-        guide_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie_export_guide.md")
+        guide_path = str(resource_path("cookie_export_guide.md"))
         try:
             with open(guide_path, "r", encoding="utf-8") as f:
                 content = f.read()
