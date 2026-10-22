@@ -81,6 +81,7 @@ class DownloadWorker(QObject):
         self.download_dir = download_dir
         self.language = language
         self.downloader = None
+        self._abort_requested = False
 
     def run(self):
         try:
@@ -90,6 +91,7 @@ class DownloadWorker(QObject):
                 log_callback=self.log.emit,
                 language=self.language,
             )
+            self.downloader.is_cancelled = self._abort_requested
             result = self.downloader.download(self.url, self.title, self.browser)
             payload = {
                 "title": result.title,
@@ -104,6 +106,7 @@ class DownloadWorker(QObject):
             self.failed.emit(str(exc))
 
     def abort(self):
+        self._abort_requested = True
         if self.downloader:
             self.downloader.is_cancelled = True
 
@@ -114,6 +117,9 @@ class WebDownloadDialog(QDialog):
         self.result_data: dict | None = None
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
+        self._cancel_requested = False
+        self._pending_result = None
+        self._pending_error = None
         self.download_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "novel_downloads")
         self.init_ui()
 
@@ -169,6 +175,7 @@ class WebDownloadDialog(QDialog):
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_box.setMaximumBlockCount(1000)
         self.log_box.setPlaceholderText(self.t("logs"))
         layout.addWidget(self.log_box)
 
@@ -189,6 +196,9 @@ class WebDownloadDialog(QDialog):
             return
 
         self.result_data = None
+        self._cancel_requested = False
+        self._pending_result = None
+        self._pending_error = None
         self.log_box.clear()
         self.progress_bar.setValue(0)
         self.status_label.setText(self.t("status_idle"))
@@ -230,6 +240,9 @@ class WebDownloadDialog(QDialog):
         self.worker.failed.connect(self.on_failed)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker.failed.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.on_thread_finished)
         self.thread.finished.connect(self.thread.deleteLater)
 
         self.thread.start()
@@ -249,6 +262,25 @@ class WebDownloadDialog(QDialog):
         self.log_box.appendPlainText(message)
 
     def on_finished(self, payload: dict):
+        self._pending_result = payload
+
+    def on_failed(self, message: str):
+        self._pending_error = message
+
+    def on_thread_finished(self):
+        # 工作线程完全退出后才能关闭对话框，避免销毁仍在运行的 QThread。
+        self.thread = None
+        self.worker = None
+        if self._cancel_requested:
+            super().reject()
+            return
+        if self._pending_error is not None:
+            self.show_download_error(self._pending_error)
+            return
+        payload = self._pending_result
+        if payload is None:
+            self.show_download_error("下载线程已结束，但没有返回结果。")
+            return
         self.result_data = payload
         self.progress_bar.setValue(100)
         self.status_label.setText(self.t("success"))
@@ -257,7 +289,7 @@ class WebDownloadDialog(QDialog):
         QMessageBox.information(self, self.t("title"), self.t("success"))
         self.accept()
 
-    def on_failed(self, message: str):
+    def show_download_error(self, message: str):
         self.progress_bar.setValue(0)
         self.status_label.setText(self.t("failed"))
         self.append_log(message)
@@ -283,9 +315,11 @@ class WebDownloadDialog(QDialog):
             QMessageBox.information(self, self.t("how_to_export"), "Please refer to cookie_export_guide.md for instructions.")
 
     def reject(self):
+        self._cancel_requested = True
         if self.thread and self.thread.isRunning():
             if self.worker:
                 self.worker.abort()
-            self.append_log("Canceling download...")
-            # We don't return here anymore, we call super().reject() to close
+            self.append_log("正在取消下载，等待当前请求结束；已完成章节会保留缓存。")
+            self.btn_close.setEnabled(False)
+            return
         super().reject()

@@ -43,6 +43,7 @@ TRANSLATIONS = {
         "next_start": "\u5373\u5c06\u4ece\u8fd9\u91cc\u5f00\u59cb\uff1a",
         "no_chapters": "\u672a\u8bc6\u522b\u5230\u7ae0\u8282\uff0c\u5c06\u6309\u4e0a\u6b21\u9605\u8bfb\u4f4d\u7f6e\u7ee7\u7eed\u3002",
         "delete_confirm_title": "\u5220\u9664\u5c0f\u8bf4",
+        "storage_failed": "保存书库失败",
         "delete_confirm_text": "\u786e\u5b9a\u8981\u5c06\u300a{title}\u300b\u4ece\u4e66\u5e93\u4e2d\u79fb\u9664\u5417\uff1f\n\n\u8fd9\u4e0d\u4f1a\u5220\u9664\u539f\u59cb TXT \u6587\u4ef6\u3002",
     },
     "EN": {
@@ -64,6 +65,7 @@ TRANSLATIONS = {
         "next_start": "Will start from: ",
         "no_chapters": "No chapters detected. Reading will resume from the last saved position.",
         "delete_confirm_title": "Remove Novel",
+        "storage_failed": "Could Not Save Library",
         "delete_confirm_text": "Remove \"{title}\" from the library?\n\nThis will not delete the original TXT file.",
     },
 }
@@ -131,6 +133,7 @@ class LibraryView(QWidget):
         self.chapter_layout = QVBoxLayout(self.chapter_group)
         self.chapter_layout.setSpacing(10)
         self.chapter_combo = QComboBox()
+        self.chapter_combo.currentIndexChanged.connect(self.on_chapter_changed)
         self.chapter_combo.activated.connect(self.on_chapter_changed)
         self.chapter_layout.addWidget(self.chapter_combo)
 
@@ -195,7 +198,8 @@ class LibraryView(QWidget):
     def toggle_language(self):
         new_lang = "EN" if self.settings.get("language", "CN") == "CN" else "CN"
         self.settings["language"] = new_lang
-        self.manager.update_settings(self.settings)
+        if not self._save_settings():
+            return
         self.retranslate_ui()
         self.settings_changed.emit()
 
@@ -225,6 +229,7 @@ class LibraryView(QWidget):
 
         for item in self.manager.data["library"]:
             self.novel_list.addItem(item["title"])
+            self.novel_list.item(self.novel_list.count() - 1).setData(Qt.ItemDataRole.UserRole, item["path"])
 
         self.novel_list.itemSelectionChanged.connect(self.on_novel_selection_changed)
 
@@ -274,9 +279,9 @@ class LibraryView(QWidget):
         if not selected:
             return None
 
-        title = selected[0].text()
+        path = selected[0].data(Qt.ItemDataRole.UserRole)
         for novel in self.manager.data["library"]:
-            if novel["title"] == title:
+            if novel["path"] == path:
                 return novel
         return None
 
@@ -284,6 +289,14 @@ class LibraryView(QWidget):
         for index in range(self.novel_list.count()):
             item = self.novel_list.item(index)
             if item.text() == title:
+                self.novel_list.setCurrentItem(item)
+                self.on_novel_selection_changed()
+                break
+
+    def select_novel_by_path(self, path: str):
+        for index in range(self.novel_list.count()):
+            item = self.novel_list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
                 self.novel_list.setCurrentItem(item)
                 self.on_novel_selection_changed()
                 break
@@ -336,18 +349,26 @@ class LibraryView(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Open TXT", "", "TXT Files (*.txt)")
         if path:
             title = os.path.splitext(os.path.basename(path))[0]
-            self.manager.add_novel(title, path)
+            try:
+                novel = self.manager.add_novel(title, path)
+            except (OSError, ValueError) as exc:
+                self._show_storage_error(exc)
+                return
             self.refresh_library()
-            self.select_novel_by_title(title)
+            self.select_novel_by_path(novel["path"])
 
     def on_download_web(self):
         dialog = WebDownloadDialog(self.settings.get("language", "CN"), self)
         if dialog.exec() and dialog.result_data:
             title = dialog.result_data["title"]
             file_path = dialog.result_data["file_path"]
-            novel = self.manager.add_novel(title, file_path)
+            try:
+                novel = self.manager.add_novel(title, file_path)
+            except (OSError, ValueError) as exc:
+                self._show_storage_error(exc)
+                return
             self.refresh_library()
-            self.select_novel_by_title(novel["title"])
+            self.select_novel_by_path(novel["path"])
 
     def on_delete_selected(self):
         novel = self.get_selected_novel()
@@ -365,7 +386,11 @@ class LibraryView(QWidget):
             return
 
         current_row = self.novel_list.currentRow()
-        self.manager.remove_novel(novel["path"])
+        try:
+            self.manager.remove_novel(novel["path"])
+        except (OSError, ValueError) as exc:
+            self._show_storage_error(exc)
+            return
         self.current_novel_path = None
         self.current_chapters = []
         self.pending_chapter_pos = None
@@ -387,7 +412,10 @@ class LibraryView(QWidget):
         if self.pending_chapter_pos is not None:
             start_pos = self.pending_chapter_pos
 
-        self.novel_selected.emit(novel.copy(), start_pos)
+        payload = novel.copy()
+        # 手动选章即使恰好等于旧游标，也不能恢复与它不一致的旧滚动比例。
+        payload["_restore_saved_scroll"] = self.pending_chapter_pos is None
+        self.novel_selected.emit(payload, start_pos)
         self.pending_chapter_pos = None
 
     def on_change_color(self):
@@ -400,9 +428,29 @@ class LibraryView(QWidget):
         self.settings["font_size"] = self.fs_slider.value()
         self.settings["text_opacity"] = self.to_slider.value() / 100.0
         self.settings["reading_mode"] = self.rm_check.isChecked()
-        self.manager.update_settings(self.settings)
+        if not self._save_settings():
+            controls = (self.fs_slider, self.to_slider, self.rm_check)
+            blocked = [control.blockSignals(True) for control in controls]
+            try:
+                self.fs_slider.setValue(self.settings["font_size"])
+                self.to_slider.setValue(round(self.settings["text_opacity"] * 100))
+                self.rm_check.setChecked(self.settings["reading_mode"])
+            finally:
+                for control, previous in zip(controls, blocked):
+                    control.blockSignals(previous)
         self.apply_preview_settings()
         self.settings_changed.emit()
+
+    def _show_storage_error(self, error):
+        QMessageBox.warning(self, self.t("storage_failed"), str(error))
+
+    def _save_settings(self):
+        try:
+            self.manager.update_settings(self.settings)
+            return True
+        except (OSError, ValueError) as exc:
+            self._show_storage_error(exc)
+            return False
 
     def apply_preview_settings(self):
         s = self.settings

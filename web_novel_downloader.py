@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
 import threading
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +75,7 @@ class WebNovelDownloader:
     MAX_CONTENT_RETRIES = 3
     MAX_CATALOG_PAGES = 200
     MAX_CHAPTER_PAGES = 24
+    CHAPTER_CACHE_VERSION = 2
 
     CHAPTER_SKIP_KEYWORDS = (
         "\u4e0a\u4e00\u7ae0",
@@ -214,6 +217,7 @@ class WebNovelDownloader:
         self.log_callback = log_callback
         self.language = language
         self.is_cancelled = False
+        self._used_chapter_cache = set()
         self._rate_limit_lock = threading.Lock()
         self._next_request_time = 0.0
         self._cooldown_until = 0.0
@@ -249,6 +253,9 @@ class WebNovelDownloader:
             self.progress_callback(current, total, message, chapter_title)
 
     def download(self, url: str, title_override: str = "", browser: str = "none") -> DownloadResult:
+        if self.is_cancelled:
+            raise WebDownloadError("下载已取消。")
+        self._used_chapter_cache.clear()
         normalized_url = self.normalize_url(url)
         hostname = (urlparse(normalized_url).hostname or "").lower()
 
@@ -385,8 +392,9 @@ class WebNovelDownloader:
             if self.is_cancelled:
                 raise WebDownloadError("Download canceled by user.")
             chapter_title, content = self._download_fanqie_single_chapter(chapter.url, title_hint=chapter.title)
-            if content:
-                chapters.append((chapter_title, content))
+            if not content or self.is_placeholder_content(content):
+                raise WebDownloadError(f"章节正文缺失，未生成不完整 TXT：{chapter_title}")
+            chapters.append((chapter_title, content))
             self.emit_progress(current, total, "progress_fanqie", chapter_title)
 
         if not chapters:
@@ -419,13 +427,19 @@ class WebNovelDownloader:
             catalog_url, catalog_soup = self.fetch_soup_with_site_fallback(catalog_url, referer=url)
         chapter_links = self.extract_chapter_links(catalog_url, catalog_soup)
 
-        if len(chapter_links) < 3:
+        if not chapter_links:
+            if self._fhxs_book_id(catalog_url):
+                raise WebDownloadError("未找到本书的有效章节目录，未生成 TXT。")
             chapter_title, content = self.download_generic_chapter(url, title_override)
             if not content:
                 raise WebDownloadError("No readable page content or chapter list was detected.")
             return self._save_txt(title_override or chapter_title, [(chapter_title, content)], url)
 
         book_title = title_override or self.extract_book_title(catalog_soup, catalog_url)
+        if self._fhxs_book_id(catalog_url):
+            declared_count = re.search(r"共\s*(\d+)\s*章", catalog_soup.get_text(" ", strip=True))
+            if declared_count and len(chapter_links) != int(declared_count.group(1)):
+                raise WebDownloadError(f"目录不完整：声明 {declared_count.group(1)} 章，实际找到 {len(chapter_links)} 章。")
         chapters = self.download_chapter_batch(chapter_links)
         if not chapters:
             raise WebDownloadError("A chapter list was detected, but every chapter download failed.")
@@ -433,6 +447,10 @@ class WebNovelDownloader:
 
     def resolve_catalog_url(self, url: str, soup: BeautifulSoup) -> str:
         parsed = urlparse(url)
+        book_id = self._fhxs_book_id(url)
+        if book_id:
+            # 下载页的 TXT 按钮可能为空，统一回到同一本书的正序目录。
+            return urlunparse(parsed._replace(path=f"/read/{book_id}/", query="", fragment=""))
         if "/index/" in parsed.path:
             return url
 
@@ -469,29 +487,76 @@ class WebNovelDownloader:
         downloaded: dict[int, tuple[str, str]] = {}
         total = len(chapter_links)
 
+        pending = list(chapter_links)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {}
-            for index, chapter in enumerate(chapter_links):
+            for attempt in range(2):
                 if self.is_cancelled:
+                    raise WebDownloadError("下载已取消，已完成的章节缓存可供重试。")
+                if attempt:
+                    self.log(f"正在重试 {len(pending)} 个失败章节。")
+                future_map = {executor.submit(self._download_cached_chapter, chapter): chapter for chapter in pending}
+                failed = []
+                for completed, future in enumerate(concurrent.futures.as_completed(future_map), 1):
+                    if self.is_cancelled:
+                        for queued in future_map:
+                            queued.cancel()
+                        raise WebDownloadError("下载已取消，已完成的章节缓存可供重试。")
+                    chapter = future_map[future]
+                    try:
+                        downloaded[chapter.index] = future.result()
+                        self._used_chapter_cache.add(self._chapter_cache_path(chapter.url))
+                    except Exception as exc:
+                        failed.append(chapter)
+                        self.log(f"章节下载失败：{chapter.title}，原因：{exc}")
+                    self.emit_progress(completed if attempt == 0 else len(downloaded), total, "progress_web", chapter.title)
+                pending = failed
+                if not pending:
                     break
-                future = executor.submit(self.download_generic_chapter, chapter.url, chapter.title)
-                future_map[future] = chapter
-
-            completed = 0
-            for future in concurrent.futures.as_completed(future_map):
-                if self.is_cancelled:
-                    raise WebDownloadError("Download canceled by user.")
-                chapter = future_map[future]
-                completed += 1
-                try:
-                    chapter_title, content = future.result()
-                    if content:
-                        downloaded[chapter.index] = (chapter_title, content)
-                except Exception as exc:
-                    self.log(f"Failed to download chapter: {chapter.title} - {exc}")
-                self.emit_progress(completed, total, "progress_web", chapter.title)
-
+        if pending:
+            names = "、".join(chapter.title for chapter in pending[:5])
+            raise WebDownloadError(
+                f"仍有 {len(pending)}/{total} 个章节下载失败：{names}。"
+                "未生成不完整 TXT；已成功的章节已缓存，再次下载同一地址可继续。"
+            )
         return [downloaded[index] for index in sorted(downloaded)]
+
+    def _download_cached_chapter(self, chapter: ChapterLink) -> tuple[str, str]:
+        if self.is_cancelled:
+            raise WebDownloadError("下载已取消。")
+        cache_path = self._chapter_cache_path(chapter.url)
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (cached.get("version") == self.CHAPTER_CACHE_VERSION and cached.get("url") == chapter.url
+                    and isinstance(cached.get("content"), str) and cached["content"].strip()
+                    and not self.is_placeholder_content(cached["content"])):
+                return chapter.title or cached["title"], cached["content"]
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            pass
+        title, content = self.download_generic_chapter(chapter.url, chapter.title)
+        if not content or self.is_placeholder_content(content):
+            raise WebDownloadError(f"章节没有可读正文：{chapter.title}")
+        title = chapter.title or title
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(cache_path, {
+            "version": self.CHAPTER_CACHE_VERSION, "url": chapter.url, "title": title, "content": content,
+        })
+        return title, content
+
+    def _chapter_cache_path(self, url: str) -> Path:
+        key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return Path(self.download_dir) / ".chapter_cache" / f"{key}.json"
+
+    @staticmethod
+    def _write_json_atomic(path: Path, data):
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as file:
+                temporary_path = Path(file.name)
+                json.dump(data, file, ensure_ascii=False, indent=2)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path and temporary_path.exists():
+                temporary_path.unlink()
 
     def download_generic_chapter(self, url: str, title_hint: str = "") -> tuple[str, str]:
         self.log(f"Downloading: {title_hint or url}")
@@ -520,23 +585,25 @@ class WebNovelDownloader:
 
         for _ in range(self.MAX_CHAPTER_PAGES):
             if current_url in visited:
-                break
+                raise WebDownloadError(f"章节分页出现循环，未保存残缺章节：{url}")
             visited.add(current_url)
 
             content, page_title, next_page_url = self.fetch_chapter_page_content(current_url, referer)
+            if not content or self.is_placeholder_content(content):
+                raise WebDownloadError(f"章节分页正文缺失：{current_url}")
             if page_title and not chapter_title:
                 chapter_title = page_title
 
             if content and (not parts or content != parts[-1]):
                 parts.append(content)
 
-            if not next_page_url or next_page_url in visited:
-                break
+            if not next_page_url:
+                return chapter_title or "Untitled Chapter", parts
 
             referer = current_url
             current_url = next_page_url
 
-        return chapter_title or "Untitled Chapter", parts
+        raise WebDownloadError(f"章节分页超过 {self.MAX_CHAPTER_PAGES} 页，未保存残缺章节：{url}")
 
     def fetch_chapter_page_content(self, url: str, referer: str = "") -> tuple[str, str, str]:
         last_content = ""
@@ -547,6 +614,8 @@ class WebNovelDownloader:
             try:
                 html = self.fetch_html(url, referer=referer)
             except Exception as exc:
+                if self.is_cancelled:
+                    raise WebDownloadError("下载已取消。") from exc
                 if attempt < self.MAX_CONTENT_RETRIES - 1:
                     self.log(f"Retrying fetch_html for {url} due to {exc}")
                     time.sleep(1.0 * (attempt + 1))
@@ -582,6 +651,8 @@ class WebNovelDownloader:
 
     def _wait_for_request_slot(self):
         while True:
+            if self.is_cancelled:
+                raise WebDownloadError("下载已取消。")
             with self._rate_limit_lock:
                 now = time.monotonic()
                 ready_at = max(self._next_request_time, self._cooldown_until)
@@ -590,7 +661,7 @@ class WebNovelDownloader:
                     return
                 delay = ready_at - now
 
-            time.sleep(delay)
+            time.sleep(min(delay, 0.1))
 
     def _retry_after_seconds(self, response, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After", "").strip()
@@ -751,9 +822,11 @@ class WebNovelDownloader:
         candidates: list[ChapterLink] = []
         seen_urls = set()
         running_index = 0
+        book_id = self._fhxs_book_id(base_url)
 
         for page_url, page_soup in catalog_pages:
-            for anchor in page_soup.select("a[href]"):
+            anchors = page_soup.select("li[chapter-id] a[href]") if book_id else page_soup.select("a[href]")
+            for anchor in anchors:
                 href = self.normalize_link(page_url, anchor.get("href"))
                 if not href or href in seen_urls:
                     continue
@@ -762,6 +835,8 @@ class WebNovelDownloader:
                 if not parsed_href.scheme.startswith("http"):
                     continue
                 if not self.is_same_site(base_host, parsed_href.hostname or ""):
+                    continue
+                if book_id and not re.fullmatch(rf"/read/{book_id}/\d+\.html", parsed_href.path):
                     continue
 
                 title = self.clean_chapter_title(anchor.get_text(" ", strip=True))
@@ -772,6 +847,9 @@ class WebNovelDownloader:
                 candidates.append(ChapterLink(title=title, url=href, index=running_index))
                 running_index += 1
 
+        if book_id:
+            # 站点目录中存在重复编号、跳号，以实际目录顺序为准。
+            return candidates
         if len(candidates) < 3:
             return []
 
@@ -788,8 +866,12 @@ class WebNovelDownloader:
                 raise WebDownloadError("Download canceled by user.")
             pages.append((current_url, current_soup))
             next_page_url = self.find_next_catalog_page(current_url, current_soup)
-            if not next_page_url or next_page_url in visited:
+            if not next_page_url:
                 break
+            if next_page_url in visited:
+                raise WebDownloadError(f"目录分页出现循环：{next_page_url}")
+            if len(pages) >= self.MAX_CATALOG_PAGES:
+                raise WebDownloadError(f"目录超过 {self.MAX_CATALOG_PAGES} 页，未生成不完整 TXT。")
             visited.add(next_page_url)
             self.log(f"Loading catalog page: {next_page_url}")
             current_soup = self.fetch_soup(next_page_url, referer=current_url)
@@ -850,6 +932,9 @@ class WebNovelDownloader:
             return False
         if next_url == current_url or "/chapter/" in next_page.path:
             return False
+        book_id = self._fhxs_book_id(current_url)
+        if book_id:
+            return bool(re.fullmatch(rf"/read/{book_id}/[01]_\d+\.html", next_page.path))
 
         current_base = self.base_page_identity(current.path)
         next_base = self.base_page_identity(next_page.path)
@@ -860,6 +945,15 @@ class WebNovelDownloader:
             return True
 
         return False
+
+    @staticmethod
+    def _fhxs_book_id(url: str) -> str:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if host != "fhxs.com" and not host.endswith(".fhxs.com"):
+            return ""
+        match = re.fullmatch(r"/(?:txtxz/(\d+)\.html|xiaoshuo_(\d+)\.html|read/(\d+)/(?:[^/]+\.html)?)", parsed.path)
+        return next((part for part in match.groups() if part), "") if match else ""
 
     def is_chapter_pagination_candidate(self, current_url: str, next_url: str) -> bool:
         current = urlparse(current_url)
@@ -972,11 +1066,12 @@ class WebNovelDownloader:
             if match:
                 numbered.append((int(match.group()), link.index, link))
 
-        if len(numbered) >= max(3, len(links) // 2):
-            ordered = [item[2] for item in sorted(numbered, key=lambda item: (item[0], item[1]))]
-            return [ChapterLink(title=link.title, url=link.url, index=index) for index, link in enumerate(ordered)]
-
         ordered = sorted(links, key=lambda link: link.index)
+        if len(numbered) >= max(3, len(links) // 2):
+            # 通用站点沿用编号排序，但不能因此丢弃序章、尾声等无编号条目。
+            numbered_urls = {item[2].url for item in numbered}
+            sorted_numbered = iter(item[2] for item in sorted(numbered, key=lambda item: (item[0], item[1])))
+            ordered = [next(sorted_numbered) if link.url in numbered_urls else link for link in ordered]
         return [ChapterLink(title=link.title, url=link.url, index=index) for index, link in enumerate(ordered)]
 
     def extract_book_title(self, soup: BeautifulSoup, url: str) -> str:
@@ -992,7 +1087,7 @@ class WebNovelDownloader:
                 if title:
                     return title
 
-        for selector in ("h1", ".book-name", ".novel-title", ".title"):
+        for selector in (".detail .name", "h1", ".book-name", ".novel-title", ".title"):
             tag = soup.select_one(selector)
             if tag:
                 title = self.clean_title(tag.get_text(" ", strip=True))
@@ -1033,12 +1128,18 @@ class WebNovelDownloader:
 
     def extract_content(self, soup: BeautifulSoup) -> str:
         candidates = []
-
+        tags = {}
         for selector in self.CONTENT_SELECTORS:
             for tag in soup.select(selector):
-                score, text = self.score_content_tag(tag)
-                if score > 0 and text:
-                    candidates.append((score, text))
+                tags[id(tag)] = tag
+        # 有明确正文子容器时不再为外层 main/article 评分，避免菜单和推荐区压过正文。
+        ancestors = {id(parent) for tag in tags.values() for parent in tag.parents}
+        for identity, tag in tags.items():
+            if identity in ancestors:
+                continue
+            score, text = self.score_content_tag(tag)
+            if score > 0 and text:
+                candidates.append((score, text))
 
         if not candidates and soup.body:
             score, text = self.score_content_tag(soup.body)
@@ -1083,20 +1184,20 @@ class WebNovelDownloader:
             if not line:
                 continue
             lowered = line.lower()
-            if any(keyword in lowered for keyword in self.CONTENT_SKIP_KEYWORDS):
+            if lowered in self.CONTENT_SKIP_KEYWORDS:
+                continue
+            if len(line) <= 160 and lowered.startswith((
+                "请收藏本站", "请记住本站", "本章未完", "点击下一页继续阅读",
+                "章节内容缺失", "稍后重新尝试", "小主，这个章节后面还有哦", "ttgcaptcha",
+            )):
+                continue
+            if len(line) <= 200 and re.fullmatch(
+                r"喜欢.+请大家收藏[:：].*(?:更新速度最快|更新最快)[。.!！]?", line,
+            ):
                 continue
             lines.append(line)
-
-        deduplicated = []
-        seen = set()
-        for line in lines:
-            key = line.lower()
-            if key in seen and len(line) > 30:
-                continue
-            seen.add(key)
-            deduplicated.append(line)
-
-        return "\n".join(deduplicated).strip()
+        # 小说可能有意重复对白或段落，不能以广告清洗的名义删除正常叙事。
+        return "\n".join(lines).strip()
 
     def clean_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", text or "").strip()
@@ -1133,23 +1234,58 @@ class WebNovelDownloader:
             return candidate
 
         suffix = time.strftime("%Y%m%d_%H%M%S")
-        return os.path.join(self.download_dir, f"{safe_title}_{suffix}.txt")
+        candidate = os.path.join(self.download_dir, f"{safe_title}_{suffix}.txt")
+        index = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(self.download_dir, f"{safe_title}_{suffix}_{index}.txt")
+            index += 1
+        return candidate
 
     def _save_txt(self, title: str, chapters: list[tuple[str, str]], source_url: str) -> DownloadResult:
+        if self.is_cancelled:
+            raise WebDownloadError("下载已取消，未生成 TXT。")
         if not chapters:
             raise WebDownloadError("No chapter content available to save.")
 
         output_title = self.clean_title(title) or chapters[0][0] or "web_novel"
         output_path = self.ensure_unique_path(output_title)
 
-        with open(output_path, "w", encoding="utf-8") as file:
-            file.write(f"{output_title}\n")
-            file.write(f"Source: {source_url}\n")
-            file.write(f"Chapters: {len(chapters)}\n\n")
-            for chapter_title, content in chapters:
-                file.write(f"{chapter_title}\n\n")
-                file.write(content.strip())
-                file.write("\n\n")
+        digest = hashlib.sha256()
+        line_index = 0
+        chapter_index = []
+        output_created = False
+        index_path = Path(output_path + ".chapters.json")
+        try:
+            with open(output_path, "xb") as file:
+                output_created = True
+
+                def write_text(text):
+                    nonlocal line_index
+                    encoded = text.encode("utf-8")
+                    file.write(encoded)
+                    digest.update(encoded)
+                    line_index += text.count("\n")
+
+                write_text(f"{output_title}\nSource: {source_url}\nChapters: {len(chapters)}\n\n")
+                for chapter_title, content in chapters:
+                    if self.is_cancelled:
+                        raise WebDownloadError("下载已取消，未生成 TXT。")
+                    chapter_title = self.clean_chapter_title(chapter_title)
+                    chapter_index.append({"title": chapter_title, "index": line_index})
+                    write_text(f"{chapter_title}\n\n{content.strip()}\n\n")
+            self._write_json_atomic(index_path, {"version": 1, "sha256": digest.hexdigest(), "chapters": chapter_index})
+        except Exception:
+            if output_created:
+                Path(output_path).unlink(missing_ok=True)
+                index_path.unlink(missing_ok=True)
+            raise
+
+        for cache_path in self._used_chapter_cache:
+            try:
+                cache_path.unlink(missing_ok=True)
+            except OSError as exc:
+                self.log(f"TXT 已保存，清理章节缓存失败：{exc}")
+        self._used_chapter_cache.clear()
 
         self.log(f"Saved TXT to: {output_path}")
         return DownloadResult(

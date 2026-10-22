@@ -41,6 +41,7 @@ class CustomReader(QTextEdit):
 
 class ReaderWindow(QMainWindow):
     progress_changed = pyqtSignal(str, int)
+    save_failed = pyqtSignal(str)
 
     def __init__(self, manager, logic):
         super().__init__()
@@ -52,6 +53,12 @@ class ReaderWindow(QMainWindow):
         self._hidden_progress_state = None
         self._last_saved_signature = None
         self._restoring_progress = False
+        self._restore_generation = 0
+        self._restore_target = None
+        self._restore_saved_scroll = True
+        self._loaded_file_signature = None
+        self.last_load_error = ""
+        self._last_save_error = None
 
         self.setWindowTitle("MoYu Reader")
         self.setMinimumSize(420, 620)
@@ -221,7 +228,7 @@ class ReaderWindow(QMainWindow):
         return pos
 
     def persist_progress(self, force=False):
-        if not self.current_novel:
+        if not self.current_novel or self._restoring_progress:
             return None
 
         state = self.current_progress_state()
@@ -233,18 +240,29 @@ class ReaderWindow(QMainWindow):
         scroll_ratio = state["last_scroll_ratio"]
         signature = (path, pos, round(scroll_ratio, 5))
 
-        self.current_novel["last_pos"] = pos
-        self.current_novel["last_scroll_ratio"] = scroll_ratio
-
         saved = False
         if force or signature != self._last_saved_signature:
-            saved = self.manager.update_progress(path, pos, state["scroll_value"], state["scroll_max"])
+            try:
+                saved = self.manager.update_progress(path, pos, state["scroll_value"], state["scroll_max"])
+            except (OSError, ValueError) as exc:
+                self._report_save_error(exc)
+                return None
             self._last_saved_signature = signature
+            self._last_save_error = None
+
+        self.current_novel["last_pos"] = pos
+        self.current_novel["last_scroll_ratio"] = scroll_ratio
 
         if force or saved:
             self.progress_changed.emit(path, pos)
 
         return dict(self.current_novel)
+
+    def _report_save_error(self, error):
+        message = f"保存阅读状态失败：{error}"
+        if message != self._last_save_error:
+            self._last_save_error = message
+            self.save_failed.emit(message)
 
     def restore_progress(self, use_saved_scroll=True, state=None):
         if not self.current_novel:
@@ -262,65 +280,126 @@ class ReaderWindow(QMainWindow):
                 return
 
         self.reader_area.ensureCursorVisible()
+        if not use_saved_scroll:
+            # 手动选章时把标题移到视口顶部，不能只保证它在当前页面内可见。
+            top = self.reader_area.cursorRect().top()
+            margin = int(self.reader_area.document().documentMargin())
+            scroll_bar.setValue(scroll_bar.value() + top - margin)
 
     def toggle_stealth_mode(self):
-        self.persist_progress(force=True)
+        state = self.persist_progress(force=True) or self._restore_target
+        use_saved_scroll = self._restore_saved_scroll if self._restoring_progress else True
         self.settings["reading_mode"] = not self.settings["reading_mode"]
-        self.manager.update_settings(self.settings)
+        if not self._save_reader_settings():
+            return
         self.apply_settings()
-        QTimer.singleShot(0, lambda: self.restore_progress(True))
+        if state:
+            self._begin_progress_restore(state, use_saved_scroll)
 
     def change_font_size(self, delta):
-        self.persist_progress(force=True)
+        state = self.persist_progress(force=True) or self._restore_target
+        use_saved_scroll = self._restore_saved_scroll if self._restoring_progress else True
         self.settings["font_size"] = max(10, min(50, self.settings["font_size"] + delta))
-        self.manager.update_settings(self.settings)
+        if not self._save_reader_settings():
+            return
         self.apply_settings()
-        QTimer.singleShot(0, lambda: self.restore_progress(True))
+        if state:
+            self._begin_progress_restore(state, use_saved_scroll)
+
+    def _save_reader_settings(self):
+        try:
+            self.manager.update_settings(self.settings)
+            self._last_save_error = None
+            return True
+        except (OSError, ValueError) as exc:
+            self._report_save_error(exc)
+            return False
 
     def load_novel(self, novel_data):
+        self.last_load_error = ""
+        try:
+            signature = self.logic.file_signature(novel_data["path"])
+        except (OSError, AttributeError):
+            signature = None
+        reuse_document = (
+            signature is not None and signature == self._loaded_file_signature
+            and self.current_novel and self.current_novel["path"] == novel_data["path"]
+        )
+        if not reuse_document:
+            content, chapters = self.logic.load_txt(novel_data["path"])
+            if not content:
+                # 读取失败不能清空正在阅读的文档，更不能把原书进度覆盖为零。
+                self.last_load_error = getattr(self.logic, "last_error", "") or "文件为空或无法读取。"
+                return False
+        self.persist_progress(force=True)
         self.progress_save_timer.stop()
         self._restoring_progress = True
-        self.current_novel = novel_data
+        self.current_novel = novel_data.copy()
         self._hidden_progress_state = None
         self._last_saved_signature = None
-        restore_saved_scroll = novel_data.pop("_restore_saved_scroll", True)
-        expected_path = novel_data["path"]
+        restore_saved_scroll = self.current_novel.pop("_restore_saved_scroll", True)
 
-        content, chapters = self.logic.load_txt(novel_data["path"])
-        self.chapters = chapters
-        self.reader_area.setPlainText(content)
+        if not reuse_document:
+            self.chapters = chapters
+            self.reader_area.setPlainText(content)
+            self._loaded_file_signature = signature
+            self.toc_menu.clear()
+            for idx, chapter in enumerate(chapters):
+                # 菜单持有动作，clear 时一并销毁，反复切书不会累积旧动作。
+                action = QAction(chapter["title"], self.toc_menu)
+                action.triggered.connect(lambda checked=False, i=idx: self.jump_to_chapter(i))
+                self.toc_menu.addAction(action)
 
-        self.toc_menu.clear()
-        for idx, chapter in enumerate(chapters):
-            action = QAction(chapter["title"], self)
-            action.triggered.connect(lambda checked=False, i=idx: self.jump_to_chapter(i))
-            self.toc_menu.addAction(action)
+        self._begin_progress_restore(self.current_novel, restore_saved_scroll)
+        return True
 
-        self.restore_progress(restore_saved_scroll, self.current_novel)
+    def _begin_progress_restore(self, state, use_saved_scroll):
+        self.progress_save_timer.stop()
+        self._restoring_progress = True
+        self._restore_generation += 1
+        generation = self._restore_generation
+        # 使用位置快照，悬停、隐藏和旧计时器都不能把布局中的临时位置当成目标。
+        self._restore_target = dict(state)
+        self._restore_saved_scroll = use_saved_scroll
+        self.restore_progress(use_saved_scroll, self._restore_target)
+        self._queue_progress_restore(generation)
+
+    def _queue_progress_restore(self, generation):
         QTimer.singleShot(
             0,
-            lambda: self._finish_initial_restore(expected_path, restore_saved_scroll, False),
+            lambda: self._finish_initial_restore(generation, False),
         )
         QTimer.singleShot(
             120,
-            lambda: self._finish_initial_restore(expected_path, restore_saved_scroll, True),
+            lambda: self._finish_initial_restore(generation, True),
         )
 
-    def _finish_initial_restore(self, expected_path, use_saved_scroll, persist):
-        if not self.current_novel or self.current_novel.get("path") != expected_path:
+    def _finish_initial_restore(self, generation, persist):
+        if generation != self._restore_generation or not self._restore_target:
             return
 
-        self.restore_progress(use_saved_scroll, self.current_novel)
-        if persist:
+        # 长篇文档会延迟计算高度，先完成布局，再等待滚动范围同步。
+        document_height = self.reader_area.document().documentLayout().documentSize().height()
+        self.restore_progress(self._restore_saved_scroll, self._restore_target)
+        if persist and self.isVisible():
+            expected_maximum = max(0, int(document_height) - self.reader_area.viewport().height())
+            if self.reader_area.verticalScrollBar().maximum() + 2 < expected_maximum:
+                QTimer.singleShot(0, lambda: self._finish_initial_restore(generation, True))
+                return
             self._restoring_progress = False
+            self._restore_target = None
             self.persist_progress(force=True)
 
     def jump_to_chapter(self, index):
         if 0 <= index < len(self.chapters):
             pos = self.chapters[index]["pos"]
-            self.set_cursor_position(pos)
-            self.reader_area.ensureCursorVisible()
-            self.persist_progress(force=True)
+            self._begin_progress_restore({"last_pos": pos}, False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 隐藏窗口加载后可能很晚才显示，真正显示时再完成布局和位置恢复。
+        if self._restore_target:
+            self._queue_progress_restore(self._restore_generation)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

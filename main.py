@@ -1,5 +1,6 @@
 # main.py
 import sys
+from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QIcon
@@ -7,6 +8,7 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QMenu, QMessageBox, QSyst
 
 from library_manager import LibraryManager
 from library_view import LibraryView
+from download_dialog import WebDownloadDialog
 from reader_logic import ReaderLogic
 from reader_window import ReaderWindow
 
@@ -15,8 +17,14 @@ class MoYuApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
+        self._quitting = False
+        self._shutdown_pending = set()
 
-        self.manager = LibraryManager()
+        try:
+            self.manager = LibraryManager(str(Path(__file__).resolve().with_name("library.json")))
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(None, "无法读取书库", str(exc))
+            raise SystemExit(1) from exc
         self.logic = ReaderLogic()
 
         self.reader_win = ReaderWindow(self.manager, self.logic)
@@ -58,6 +66,7 @@ class MoYuApp:
         self.library_win.novel_selected.connect(self.open_novel)
         self.library_win.settings_changed.connect(self.reader_win.apply_settings)
         self.reader_win.progress_changed.connect(self.library_win.sync_progress)
+        self.reader_win.save_failed.connect(lambda message: QMessageBox.warning(self.main_win, "保存失败", message))
 
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self.app)
@@ -100,15 +109,41 @@ class MoYuApp:
             self.main_win.show()
 
     def open_novel(self, novel_data, start_pos=0):
-        novel_data["_restore_saved_scroll"] = start_pos == novel_data.get("last_pos", 0)
+        novel_data.setdefault("_restore_saved_scroll", start_pos == novel_data.get("last_pos", 0))
         novel_data["last_pos"] = start_pos
-        self.reader_win.load_novel(novel_data)
+        if self.reader_win.load_novel(novel_data) is False:
+            QMessageBox.warning(self.main_win, "无法打开小说", f"{novel_data['path']}\n{self.reader_win.last_load_error}")
+            return
         self.reader_win.show()
         self.main_win.hide()
 
     def quit_app(self):
+        if self._quitting:
+            return
+        self._quitting = True
         self.reader_win.persist_progress()
-        self.app.quit()
+        downloads = [dialog for dialog in self.library_win.findChildren(WebDownloadDialog)
+                     if dialog.thread is not None]
+        self._shutdown_pending = {dialog.thread for dialog in downloads}
+        if not downloads:
+            self.app.quit()
+            return
+        # 托盘退出也必须等工作线程结束，不能直接销毁下载中的对话框。
+        self.main_win.setEnabled(False)
+        for dialog in downloads:
+            thread = dialog.thread
+            thread.finished.connect(lambda thread=thread: self._download_stopped_for_shutdown(thread))
+            dialog.reject()
+            # 线程可能在收集列表与连接信号之间结束，补查并通过集合避免重复处理。
+            if not thread.isRunning():
+                self._download_stopped_for_shutdown(thread)
+
+    def _download_stopped_for_shutdown(self, thread):
+        if thread not in self._shutdown_pending:
+            return
+        self._shutdown_pending.remove(thread)
+        if not self._shutdown_pending:
+            self.app.quit()
 
     def run(self):
         sys.exit(self.app.exec())

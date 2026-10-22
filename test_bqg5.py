@@ -1,31 +1,22 @@
-import sys
-import os
-
-# Put src in path so imports work
-sys.path.insert(0, os.path.abspath('.'))
+import tempfile
 
 from web_novel_downloader import WebNovelDownloader
-import logging
 
-def log_cb(msg):
-    print(f"LOG: {msg}")
 
-downloader = WebNovelDownloader("./temp_dl", log_callback=log_cb)
+def main():
+    # 在线冒烟测试仅在显式运行脚本时执行，测试发现和模块导入均不访问网络。
+    with tempfile.TemporaryDirectory(prefix="reader_catalog_test_") as directory:
+        downloader = WebNovelDownloader(directory, log_callback=print)
+        url = "https://m.bqg5.com/1_1771/"
+        print(f"正在检查目录：{url}")
+        soup = downloader.fetch_soup(url)
+        # extract_chapter_links 已遍历目录分页，不能为每页再次重复遍历。
+        chapters = downloader.extract_chapter_links(url, soup)
+        if not chapters:
+            raise RuntimeError("未发现有效章节，在线目录检查失败。")
+        print(f"目录检查通过，共 {len(chapters)} 章。")
 
-# only fetch catalog
-url = "https://m.bqg5.com/1_1771/"
-print(f"Fetching: {url}")
-soup = downloader.fetch_soup(url)
-pages = downloader.collect_catalog_pages(url, soup)
 
-print(f"Collected {len(pages)} pages.")
-
-# count links in those pages
-total_links = 0
-for idx, (p_url, p_soup) in enumerate(pages):
-    links = downloader.extract_chapter_links(p_url, p_soup)
-    print(f"Page {idx} ({p_url}): {len(links)} chapter links found.")
-    total_links += len(links)
-    
-print(f"Total: {total_links}")
+if __name__ == "__main__":
+    main()
 

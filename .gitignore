@@ -1,3 +1,12 @@
 __pycache__/
 *.pyc
 library.json
+library.json.bak
+.library-*.tmp
+novel_downloads/
+test_downloads/
+temp_dl/
+.venv/
+venv/
+/cookies*.txt
+/cookies*.json
