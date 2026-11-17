@@ -26,6 +26,7 @@ except ImportError as exc:
 
 from browser_cookie_importer import CookieImportError, import_browser_cookies
 from novel_page_parser import NovelPageParser
+from ajax_catalog import CatalogProtocolError, load_encrypted_catalog
 
 TRANSLATIONS = {
     "CN": {
@@ -809,7 +810,7 @@ class WebNovelDownloader:
             trans = TRANSLATIONS.get(self.language, TRANSLATIONS["EN"])
             raise WebDownloadError(trans["verification_required"].format(url=requested_url))
 
-    def post_html(self, url: str, payload: dict, referer: str) -> str:
+    def post_html(self, url: str, payload: dict, referer: str, extra_headers: Optional[dict] = None) -> str:
         last_error = None
         for attempt in range(3):
             self._wait_for_request_slot()
@@ -817,7 +818,7 @@ class WebNovelDownloader:
                 response = self.session.post(
                     url,
                     data=payload,
-                    headers={"Referer": referer},
+                    headers={"Referer": referer, **(extra_headers or {})},
                     timeout=15,
                 )
                 if response.status_code == 429:
@@ -923,8 +924,16 @@ class WebNovelDownloader:
         return self._response_base_url(fallback_url), soup
 
     def extract_chapter_links(self, base_url: str, soup: BeautifulSoup) -> list[ChapterLink]:
-        if not self.parser.catalog_links(base_url, soup):
+        initial_entries = self.parser.catalog_links(base_url, soup)
+        if not initial_entries:
             return []
+        try:
+            dynamic_entries = load_encrypted_catalog(self, base_url, soup, initial_entries)
+        except CatalogProtocolError as exc:
+            raise WebDownloadError(str(exc)) from exc
+        if dynamic_entries is not None:
+            return [ChapterLink(self.clean_chapter_title(title), href, index)
+                    for index, (title, href) in enumerate(dynamic_entries)]
         catalog_pages = self.collect_catalog_pages(base_url, soup)
         candidates: list[ChapterLink] = []
         seen_urls = set()

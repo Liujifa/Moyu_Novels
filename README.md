@@ -2,7 +2,7 @@
 
 面向 Windows 的桌面 TXT 小说阅读器。常驻系统托盘，支持置顶阅读、透明文字、章节跳转、阅读进度保存，以及网页小说下载入库。
 
-使用 **Python 3.9+ · PyQt6 · Requests · BeautifulSoup4 · Chardet** 构建。
+使用 **Python 3.9+ · PyQt6 · Requests · BeautifulSoup4 · Chardet · PyCryptodome** 构建。
 
 **直接使用：** [下载 Windows 64 位免安装包](https://github.com/Liujifa/Mess-Around/releases/latest)。无需安装 Python，完整解压后双击 `MoYuReader.exe`。
 
@@ -27,7 +27,7 @@
 
 ### 方式一：下载免安装包（推荐）
 
-1. 打开 [Releases](https://github.com/Liujifa/Mess-Around/releases/latest)，下载 `MoYuReader-v1.0.1-Windows-x64.zip`。
+1. 打开 [Releases](https://github.com/Liujifa/Mess-Around/releases/latest)，下载 `MoYuReader-v1.0.2-Windows-x64.zip`。
 2. 完整解压 ZIP 到本地目录，双击 `MoYuReader.exe`。请保留旁边的 `_internal` 文件夹，不要在压缩软件内部运行。
 3. 启动后直接显示书库。导入 TXT 或从网页下载，选择章节后点击 **开始阅读**。
 
@@ -78,6 +78,7 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 | HTML 目录 | 根据链接分组、路径和目录结构发现章节，支持无编号标题和多卷目录，过滤导航与推荐书 |
 | 详情页或下载页 | 沿实际目录、开始阅读等入口寻找目录；没有目录时尝试 TXT 下载链接 |
 | 目录分页 | 识别分页路径、查询参数、下一页链接、数字分页和下拉选项，并保留书籍标识 |
+| 动态目录 | 支持 mopbook 当前使用的 `chapterPageAjxa` 请求协议，从公开脚本读取固定参数，逐页获取目录并验证完整性 |
 | 内嵌 JSON | 读取 JSON-LD、`application/json`、`__NEXT_DATA__` 中的章节列表和正文，不执行脚本 |
 | JSON 接口 | 支持直接输入包含章节 URL 列表或 `chapterContent`、`articleBody` 等字段的接口地址 |
 | HTML 正文 | 对正文容器评分、过滤链接密集区域并合并章节分页；保留已有部分 AJAX 正文兼容逻辑 |
@@ -106,7 +107,9 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 
 **动态页面的边界：** 程序不会运行任意 JavaScript。如果正文只在浏览器执行脚本后才出现，原始 HTML 和内嵌 JSON 均不含正文，需要提供可访问的数据接口或另行使用浏览器渲染。CSS 规则无法提取响应中不存在的数据；登录、验证码和接口鉴权也可能限制下载。
 
-若目录通过脚本加载后续章节，且分页控件只提供数字参数、没有真实分页链接，程序会提示目录尚未读全。mopbook 当前详情页属于这种情况：单章分页已修复，但整本目录的动态加载尚未支持，不能把页面初始显示的 100 章当作全书。具体样本与验证范围见 [分页验证记录](docs/pagination-verification.md)。
+v1.0.2 已补上 mopbook 的动态目录加载：按页面的书籍编号和章节范围请求全部目录页，不依赖域名白名单，也不执行远程脚本。目录接口复用现有会话、Cookie、限速、重试和取消流程。空页、缺页、重复章节、跨书籍数据或未包含页面声明的最新章节时会报告失败。
+
+其他尚未识别的脚本目录仍会提示未读全，CSS 选择器无法生成接口尚未返回的数据。具体样本与验证范围见 [分页验证记录](docs/pagination-verification.md)。
 
 ### 完整性、重试与取消
 
@@ -180,13 +183,14 @@ python -m unittest discover -v
 - 选章优先级、长篇延迟布局、同名书籍与 Unicode 偏移；
 - 目录分页、正文清洗、缺章重试、缓存续传和索引校验；
 - 连字符正文分页、误标“下一章”的后半页、静态 Base64 段落、分页标题校验及旧半章缓存失效；
+- 加密参数动态目录的完整加载、空页与重复响应、书籍与章节范围校验，以及接口加载取消；
 - 任意域名目录发现、多卷与无编号章节、HTML / JSON / TXT、重定向、手动规则及规则向工作线程传递；
 - 下载线程取消、重试与托盘安全退出；
 - 书库原子保存、磁盘故障回滚、旧数据兼容与损坏文件保护；
 - 文档复用、目录动作释放和读取失败后的状态保留。
 - 书库搜索、空状态、语言切换后的手动选章、短窗口表单滚动，以及发布版数据目录隔离。
 
-其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖异常路径，`test_generic_downloader.py` 覆盖通用解析规则，`test_ui_release.py` 覆盖界面与发布路径，`test_chapter_pagination.py` 覆盖多页章节，`test_cookie_regressions.py` 覆盖 Cookie 导入及验证页保护。
+其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖异常路径，`test_generic_downloader.py` 覆盖通用解析规则，`test_ui_release.py` 覆盖界面与发布路径，`test_chapter_pagination.py` 覆盖多页章节，`test_cookie_regressions.py` 覆盖 Cookie 导入及验证页保护，`test_ajax_catalog.py` 覆盖动态目录协议。
 
 ### 构建 Windows 发布包
 
@@ -231,6 +235,7 @@ python test_bqg5.py https://example.com/novel/catalog --chapter-links ".chapters
 | `download_dialog.py` | 下载界面与 Qt 工作线程生命周期 |
 | `web_novel_downloader.py` | 目录与正文抓取、分页、限速、重试及 TXT 输出 |
 | `novel_page_parser.py` | 通用目录发现、链接分组、分页识别、结构化数据与 CSS 规则 |
+| `ajax_catalog.py` | 已识别动态目录协议的参数编码、分页读取与完整性校验 |
 | `browser_cookie_importer.py` | 浏览器与文件 Cookie 导入 |
 | `styles.py` | 书库和阅读器样式 |
 | `app_paths.py` | 应用版本、只读资源和可写数据目录 |

@@ -43,7 +43,7 @@ def main():
     licenses.mkdir(exist_ok=True)
     versions = {}
     runtime = ["PyQt6", "PyQt6-Qt6", "PyQt6-sip", "requests", "urllib3", "certifi",
-               "charset-normalizer", "chardet", "idna", "beautifulsoup4", "soupsieve", "typing_extensions", "PyInstaller"]
+               "charset-normalizer", "chardet", "idna", "beautifulsoup4", "soupsieve", "typing_extensions", "PyInstaller", "pycryptodome"]
     for name in runtime:
         distribution = importlib.metadata.distribution(name)
         versions[name] = distribution.version

@@ -7,6 +7,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from PyQt6.QtTest import QTest
 
@@ -70,7 +71,13 @@ def run(output_directory):
             class Handler(BaseHTTPRequestHandler):
                 def do_GET(self):
                     if self.path == "/book/":
-                        text = '<h1>通用下载自检</h1><ol><li><a href="demo-1.html">第一章</a></li><li><a href="demo-2.html">第二章</a></li></ol>'
+                        text = ('<h1>通用下载自检</h1><div class="chapter_list"><a href="demo-1.html">第一章</a><a href="demo-2.html">第二章</a></div>'
+                                '<div data-aid="demo"><span class="chapter_page"><select><option value="1">1-2章</option>'
+                                '<option value="2">3-4章</option></select></span></div><script src="/catalog-helper.js"></script>')
+                    elif self.path == "/catalog-helper.js":
+                        text = ("class AESCrypt { constructor(key) { this.iv=CryptoJS.enc.Utf8.parse('1111111111111111'); } "
+                                "encrypt(data) { return CryptoJS.AES.encrypt(data,key,{mode:CryptoJS.mode.CBC,padding:CryptoJS.pad.Pkcs7}); } } "
+                                "function chapterPageAjxa(data) { return new AESCrypt('00000000000000000000000000000000').encrypt(data); }")
                     elif self.path == "/book/demo-1.html":
                         text = '<h1>第一章</h1><article><p>连字符分页前半段。</p></article><a href="demo-1-2.html">下一页 »</a>'
                     elif self.path == "/book/demo-1-2.html":
@@ -80,6 +87,8 @@ def run(output_directory):
                         text = '<h1>第二章（第1页）</h1><article><script>document.writeln(qsbs.bb(\'' + encoded + '\'));</script></article><a href="demo-2_1.html">下一章</a>'
                     elif self.path == "/book/demo-2_1.html":
                         text = '<h1>第二章（第2页）</h1><article><p>误标下一章的后半段。</p></article>'
+                    elif self.path == "/book/demo-3.html":
+                        text = '<h1>第三章</h1><article><p>动态目录第三章正文。</p></article>'
                     else:
                         self.send_error(404)
                         return
@@ -87,6 +96,25 @@ def run(output_directory):
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.end_headers()
                     self.wfile.write(text.encode("utf-8"))
+
+                def do_POST(self):
+                    from Crypto.Cipher import AES
+                    from Crypto.Util.Padding import unpad
+
+                    if self.path != "/index.php?action=loadChapterPage":
+                        self.send_error(404)
+                        return
+                    form = parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode("ascii"))
+                    decoded = json.loads(unpad(AES.new(b"0" * 32, AES.MODE_CBC, b"1" * 16).decrypt(base64.b64decode(form["data"][0])), 16))
+                    assert decoded["id"] == "demo"
+                    numbers = [1, 2] if decoded["page"] == 1 else [3]
+                    names = {1: "第一章", 2: "第二章", 3: "第三章"}
+                    rows = [{"chaptername": names[number], "chapterurl": f"/book/demo-{number}.html", "chapterorder": str(number)} for number in numbers]
+                    body = json.dumps({"code": 0, "data": rows}, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(body)
 
                 def log_message(self, *_):
                     pass
@@ -98,14 +126,15 @@ def run(output_directory):
                 downloader = WebNovelDownloader(str(Path(temporary) / "downloads"))
                 downloader.session.trust_env = False
                 result = downloader.download(f"http://127.0.0.1:{server.server_port}/book/")
-                assert result.chapter_count == 2
-                assert len(ReaderLogic().get_chapters(result.file_path)) == 2
+                assert result.chapter_count == 3
+                assert len(ReaderLogic().get_chapters(result.file_path)) == 3
                 downloaded_text = Path(result.file_path).read_text(encoding="utf-8")
-                for fragment in ("连字符分页前半段。", "连字符分页后半段。", "静态编码前半段。", "误标下一章的后半段。"):
+                for fragment in ("连字符分页前半段。", "连字符分页后半段。", "静态编码前半段。", "误标下一章的后半段。", "动态目录第三章正文。"):
                     assert fragment in downloaded_text
                 assert downloader.charset
                 checks["http_download_and_chapter_index"] = True
                 checks["multi_page_chapters"] = True
+                checks["encrypted_dynamic_catalog"] = True
             finally:
                 server.shutdown()
                 server.server_close()

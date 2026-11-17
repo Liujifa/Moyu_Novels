@@ -107,7 +107,7 @@ if not exist "%~dp0requirements.txt" (
     exit /b 1
 )
 
-%PY_CMD% -c "import PyQt6, requests, bs4, chardet" >nul 2>nul
+%PY_CMD% -c "import PyQt6, requests, bs4, chardet; from Crypto.Cipher import AES" >nul 2>nul
 if not errorlevel 1 exit /b 0
 
 echo [Info] Missing Python packages detected. Installing requirements...
@@ -119,5 +119,5 @@ if defined VIRTUAL_ENV (
 if errorlevel 1 exit /b 1
 
 echo [Info] Verifying installation...
-%PY_CMD% -c "import PyQt6, requests, bs4, chardet" >nul 2>nul
+%PY_CMD% -c "import PyQt6, requests, bs4, chardet; from Crypto.Cipher import AES" >nul 2>nul
 exit /b %errorlevel%
