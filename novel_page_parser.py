@@ -139,6 +139,7 @@ class NovelPageParser:
         for container, candidates in groups.values():
             attributes = " ".join([container.get("id", ""), *container.get("class", [])])
             semantic = bool(re.search(r"chapter|catalog|\btoc\b|目录|章节|listmain", attributes, re.I))
+            explicit_list = bool(re.search(r"(?:^|\s)(?:chapters?|chapter[-_]?list|catalog(?:[-_]?list)?|toc|listmain)(?:$|\s)", attributes, re.I))
             semantic = semantic or (directory_heading and container.name in {"ol", "dl"})
             candidates = candidates if semantic else self.coherent(candidates, scope)
             count = len(candidates)
@@ -150,9 +151,10 @@ class NovelPageParser:
                 continue
             density = count / max(1, len(container.select("a[href]")))
             score = count * (2 + 2 * headings + 2 * density + int(same_branch)) + min(count, 10) * int(semantic)
-            scored.append((score, count, candidates))
+            scored.append((explicit_list, score, count, candidates))
         if scored:
-            chosen = max(scored, key=lambda item: (item[0], item[1]))[2]
+            # 明确的章节列表优先于外层混合区域，避免“最新章节”和同路径推荐书撑高总分。
+            chosen = max(scored, key=lambda item: (item[0], item[1], item[2]))[3]
             return [(title, href) for title, href, _ in chosen]
         return self.structured_chapters(url, soup)
 

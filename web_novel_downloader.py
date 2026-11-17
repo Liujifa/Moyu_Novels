@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -27,6 +29,7 @@ from novel_page_parser import NovelPageParser
 
 TRANSLATIONS = {
     "CN": {
+        "verification_required": "站点返回了人工身份验证页面：{url}\n\n请先在浏览器打开同一地址并完成验证码，再导入该浏览器的本站 Cookie；若直接导入被占用或加密限制阻止，请导出为 JSON / Netscape 文件后选择“从文件导入”。浏览器与下载器应使用相同网络；Cookie 过期或浏览器环境绑定时仍可能验证失败。未保存验证页为小说。",
         "access_denied": "\u8bbf\u95ee\u88ab\u62d2\u7edd (403 Forbidden)\uff1a{url}\u3002\n\n\u8fd9\u901a\u5e38\u610f\u5473\u7740 {hostname} \u5f00\u542f\u4e86\u53cd\u722c\u866b\u4fdd\u62a4\uff08\u5982 Cloudflare\uff09\u3002\n\u89e3\u51b3\u65b9\u6848\uff1a\u8bf7\u5148\u5728\u6d4f\u89c8\u5668\u4e2d\u8bbf\u95ee\u8be5\u7f51\u7ad9\u5e76\u901a\u8fc7\u4eba\u673a\u9a8c\u8bc1\uff0c\u7136\u540e\u5728\u672c\u8f6f\u4ef6\u4e2d\u4f7f\u7528\u201c\u5bfc\u5165\u6d4f\u89c8\u5668 Cookie\u201d\u6216\u201c\u4ece\u6587\u4ef6\u5bfc\u5165\u201d\u529f\u80fd\u3002",
         "import_file_failed": "\u4ece\u9009\u62e9\u7684\u6587\u4ef6\u5bfc\u5165 Cookie \u5931\u8d25\u3002",
         "import_browser_failed": "\u5bfc\u5165\u6d4f\u89c8\u5668 Cookie \u5931\u8d25\u3002",
@@ -34,6 +37,7 @@ TRANSLATIONS = {
         "import_browser_success": "\u5df2\u4ece {browser} \u5bfc\u5165 {domain} \u7684 Cookie",
     },
     "EN": {
+        "verification_required": "The site returned a human verification page: {url}\n\nComplete verification in your browser, then import this site's cookies. If browser import is locked or encrypted, export JSON / Netscape cookies and use Import from file. Use the same network; expired or browser-bound cookies may still be rejected. The verification page was not saved as a novel.",
         "access_denied": "Access Denied (403 Forbidden) for {url}.\n\nThis usually means {hostname} has anti-bot protection (like Cloudflare).\nSolution: Visit the site in your browser, pass any 'Verify you are human' checks, then use the 'Import Browser Cookie' or 'Import from file' feature.",
         "import_file_failed": "Failed to import cookies from the selected file.",
         "import_browser_failed": "Failed to import browser cookies.",
@@ -77,7 +81,7 @@ class WebNovelDownloader:
     MAX_CATALOG_PAGES = 200
     MAX_CHAPTER_PAGES = 24
     MAX_DISCOVERY_PAGES = 6
-    CHAPTER_CACHE_VERSION = 3
+    CHAPTER_CACHE_VERSION = 4
 
     CHAPTER_SKIP_KEYWORDS = (
         "\u4e0a\u4e00\u7ae0",
@@ -355,20 +359,8 @@ class WebNovelDownloader:
         raise WebDownloadError(str(last_error or trans["import_browser_failed"]))
 
     def _cookie_domains(self, hostname: str) -> list[str]:
-        parts = [part for part in hostname.split(".") if part]
-        candidates = []
-        for size in range(len(parts), 1, -1):
-            candidates.append(".".join(parts[-size:]))
-        if hostname:
-            candidates.insert(0, hostname)
-
-        seen = set()
-        result = []
-        for domain in candidates:
-            if domain not in seen:
-                seen.add(domain)
-                result.append(domain)
-        return result
+        # 导入器负责匹配合法父域；逐级退到顶级域会误导入无关网站的 Cookie。
+        return [hostname] if hostname else []
 
     def _is_fanqie_book_url(self, url: str) -> bool:
         parsed = urlparse(url)
@@ -615,11 +607,24 @@ class WebNovelDownloader:
         return chapter_title, "\n\n".join(parts).strip()
 
     def collect_chapter_pages(self, url: str, title_hint: str = "") -> tuple[str, list[str]]:
+        previous_root = getattr(self._response_state, "chapter_root", None)
+        # 并发下载时按线程保留目录中的原始章节入口，区分 book_1/book_2 与 book_1_2。
+        self._response_state.chapter_root = self.normalize_url(url)
+        try:
+            return self._collect_chapter_pages(url, title_hint)
+        finally:
+            if previous_root is None:
+                del self._response_state.chapter_root
+            else:
+                self._response_state.chapter_root = previous_root
+
+    def _collect_chapter_pages(self, url: str, title_hint: str = "") -> tuple[str, list[str]]:
         visited = set()
         parts = []
         chapter_title = self.clean_chapter_title(title_hint)
         current_url = self.normalize_url(url)
         referer = ""
+        first_page_title = ""
 
         for _ in range(self.MAX_CHAPTER_PAGES):
             if current_url in visited:
@@ -631,6 +636,12 @@ class WebNovelDownloader:
                 raise WebDownloadError(f"章节分页正文缺失：{current_url}")
             if page_title and not chapter_title:
                 chapter_title = page_title
+            normalized_title = self.normalize_chapter_title(page_title)
+            if not parts:
+                first_page_title = normalized_title
+            elif first_page_title and normalized_title and normalized_title != first_page_title:
+                # URL 相似只能作为线索，分页正文的章节标题发生变化时必须停止，不能合并下一章。
+                raise WebDownloadError(f"分页跳到了不同章节，未保存混合正文：{current_url}")
 
             if content and (not parts or content != parts[-1]):
                 parts.append(content)
@@ -660,7 +671,10 @@ class WebNovelDownloader:
                     continue
                 raise
 
+            requested_url = url
             url = self._response_base_url(url)
+            if getattr(self._response_state, "chapter_root", None) == requested_url:
+                self._response_state.chapter_root = url
             html = self.resolve_ajax_content(url, html)
             soup = self._soup_from_response(html)
             page_title = self.clean_chapter_title(self.extract_chapter_title(soup))
@@ -750,6 +764,7 @@ class WebNovelDownloader:
                     continue
 
                 response.raise_for_status()
+                self._check_verification_response(response, url)
 
                 self._register_request_success()
 
@@ -784,6 +799,16 @@ class WebNovelDownloader:
             raise last_error
         raise WebDownloadError(f"Failed to download: {url}")
 
+    def _check_verification_response(self, response, requested_url):
+        path = urlparse(response.url or requested_url).path.lower()
+        html = response.text
+        redirected = "/waf/verify/" in path or "/cdn-cgi/challenge-platform/" in path
+        captcha_form = bool(re.search(r'<input\b[^>]*(?:name|id)\s*=\s*[\"\']GOEDGE_WAF_CAPTCHA_CODE[\"\']', html, re.I))
+        cloudflare_form = 'id="challenge-form"' in html and bool(re.search(r"cf[-_]chl|challenge-platform", html, re.I))
+        if redirected or captcha_form or cloudflare_form:
+            trans = TRANSLATIONS.get(self.language, TRANSLATIONS["EN"])
+            raise WebDownloadError(trans["verification_required"].format(url=requested_url))
+
     def post_html(self, url: str, payload: dict, referer: str) -> str:
         last_error = None
         for attempt in range(3):
@@ -803,6 +828,7 @@ class WebNovelDownloader:
                     continue
 
                 response.raise_for_status()
+                self._check_verification_response(response, url)
                 self._register_request_success()
                 response.encoding = response.apparent_encoding or response.encoding or "utf-8"
                 return response.text
@@ -860,7 +886,22 @@ class WebNovelDownloader:
                 return soup
             except ValueError:
                 pass
-        return BeautifulSoup(content, "html.parser")
+        soup = BeautifulSoup(content, "html.parser")
+        # 部分站点把段落放在静态 Base64 字面量中；只解码已知写入形式，不运行任意脚本。
+        literal_write = re.compile(
+            r"\s*document\.write(?:ln)?\(\s*(?:atob|qsbs\.bb)\(\s*(['\"])([A-Za-z0-9+/=\s]+)\1\s*\)\s*\)\s*;?\s*"
+        )
+        for script in list(soup.select("script:not([src])")):
+            match = literal_write.fullmatch(script.string or script.get_text())
+            if not match:
+                continue
+            try:
+                decoded = base64.b64decode(re.sub(r"\s+", "", match.group(2)), validate=True).decode("utf-8")
+            except (ValueError, UnicodeError, binascii.Error):
+                continue
+            if re.match(r"\s*<(?:p|div|span|br|section)\b", decoded, re.I):
+                script.replace_with(BeautifulSoup(decoded, "html.parser"))
+        return soup
 
     def fetch_soup_with_site_fallback(
         self,
@@ -911,6 +952,13 @@ class WebNovelDownloader:
             pages.append((current_url, current_soup))
             next_page_url = self.find_next_catalog_page(current_url, current_soup)
             if not next_page_url:
+                for select in current_soup.select("select"):
+                    options = select.select("option[value]")
+                    ranged = [option for option in options if re.search(r"\d+\s*[-—~～]\s*\d+\s*章", option.get_text())]
+                    selected = next((index for index, option in enumerate(options) if option.has_attr("selected")), 0)
+                    if (len(ranged) > 1 and selected < len(options) - 1
+                            and all(option.get("value", "").isdigit() for option in options)):
+                        raise WebDownloadError("目录包含尚未读取的脚本分页，未生成不完整 TXT。请提供含完整章节链接的目录页；CSS 规则不能生成网页脚本尚未返回的章节。")
                 break
             if next_page_url in visited:
                 raise WebDownloadError(f"目录分页出现循环：{next_page_url}")
@@ -962,7 +1010,9 @@ class WebNovelDownloader:
             return ""
         for anchor in soup.select("a[href], link[rel='next'][href]"):
             label = self.clean_text(anchor.get("aria-label") or anchor.get_text(" ", strip=True)).lower()
-            if not self.is_next_page_label(label) and "next" not in anchor.get("rel", []):
+            normalized_label = self.normalize_navigation_label(label)
+            next_chapter_label = normalized_label in {"下一章", "下一节", "下一章節", "下一章节", "next chapter"}
+            if not self.is_next_page_label(label) and not next_chapter_label and "next" not in anchor.get("rel", []):
                 continue
 
             href = self.normalize_link(current_url, anchor.get("href"))
@@ -979,9 +1029,11 @@ class WebNovelDownloader:
         return ""
 
     def is_next_page_label(self, label: str) -> bool:
+        return self.normalize_navigation_label(label) in self.NEXT_PAGE_TEXTS
+
+    def normalize_navigation_label(self, label: str) -> str:
         normalized = self.clean_text(label).lower()
-        normalized = re.sub(r"^[\[\(\u3010\uff08<]+|[\]\)\u3011\uff09>\u00bb\u203a\u2192]+$", "", normalized).strip()
-        return normalized in self.NEXT_PAGE_TEXTS
+        return normalized.strip("[]()【】（）<>«»‹›←→ \t\r\n")
 
     def is_catalog_pagination_candidate(self, current_url: str, next_url: str) -> bool:
         return self.parser.catalog_pagination_candidate(current_url, next_url)
@@ -1003,12 +1055,24 @@ class WebNovelDownloader:
         if next_url == current_url:
             return False
 
-        return self.chapter_page_identity(current_url) == self.chapter_page_identity(next_url)
+        if self.chapter_page_identity(current_url)[2] != self.chapter_page_identity(next_url)[2]:
+            return False
+        root_url = getattr(self._response_state, "chapter_root", current_url)
+        root = urlparse(root_url)
+        if root.path == next_page.path:
+            return True
+        stem = re.sub(r"\.(?:html?|shtml)$", "", root.path, flags=re.I)
+        if re.fullmatch(re.escape(stem) + r"[_-]\d+\.(?:html?|shtml)", next_page.path, re.I):
+            return True
+        return bool(re.search(r"/page/\d+$", root.path) and
+                    re.sub(r"/page/\d+$", "/page", root.path) == re.sub(r"/page/\d+$", "/page", next_page.path))
 
     def chapter_page_identity(self, url: str) -> tuple[str, str, str]:
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
         path = re.sub(r"_(\d+)\.html$", ".html", path, flags=re.IGNORECASE)
+        # 连字符后已有章节编号时，再追加的编号才是页码，不能抹掉 book-1 中的章节号。
+        path = re.sub(r"([^/]+-\d+)-\d+(\.(?:html?|shtml))$", r"\1\2", path, flags=re.IGNORECASE)
         path = re.sub(r"/page/\d+$", "/page", path, flags=re.IGNORECASE)
 
         query = parse_qs(parsed.query, keep_blank_values=True)
@@ -1151,6 +1215,11 @@ class WebNovelDownloader:
         return self.clean_title(fallback) or "web_novel"
 
     def extract_chapter_title(self, soup: BeautifulSoup) -> str:
+        for tag in soup.select("h1, h2, .chapter-title, .headline"):
+            title = self.clean_text(tag.get_text(" ", strip=True))
+            title = re.split(r"\s*[>›»]\s*(?=第|chapter\b)", title, flags=re.I)[-1]
+            if any(re.search(pattern, title, re.I) for pattern in self.CHAPTER_PATTERNS):
+                return title
         for selector in ("h1", ".chapter-title", ".title", ".headline"):
             tag = soup.select_one(selector)
             if tag:
@@ -1277,17 +1346,14 @@ class WebNovelDownloader:
 
     def clean_chapter_title(self, text: str) -> str:
         title = self.clean_text(text)
-        title = re.sub(r"[(\uff08]\d+/\d+[)\uff09]\s*$", "", title).strip()
+        title = re.sub(r"[(\uff08]\s*\d+\s*/\s*\d+\s*[)\uff09]\s*$", "", title).strip()
         title = re.sub(r"[\u002c\uff0c]\s*\d+\s*\u9875\s*$", "", title).strip()
         title = re.sub(r"\s*-\s*\d+\s*/\s*\d+\s*$", "", title).strip()
+        title = re.sub(r"\s*[（(]\s*第?\s*\d+\s*页\s*[）)]\s*$", "", title).strip()
         return title
 
     def normalize_chapter_title(self, text: str) -> str:
-        title = self.clean_text(text)
-        title = re.sub(r"[(\uff08]\d+/\d+[)\uff09]\s*$", "", title).strip()
-        title = re.sub(r"[,，]\s*\d+\s*\u9875\s*$", "", title).strip()
-        title = re.sub(r"\s*-\s*\d+\s*/\s*\d+\s*$", "", title).strip()
-        return title
+        return self.clean_chapter_title(text)
 
     def sanitize_filename(self, filename: str) -> str:
         safe = filename or "web_novel"

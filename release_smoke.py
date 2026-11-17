@@ -1,6 +1,7 @@
 """发布包自检：使用临时书库验证界面、读写和本地 HTTP 下载，不接触个人数据。"""
 
 import json
+import base64
 import os
 import tempfile
 import threading
@@ -69,9 +70,19 @@ def run(output_directory):
             class Handler(BaseHTTPRequestHandler):
                 def do_GET(self):
                     if self.path == "/book/":
-                        text = '<h1>通用下载自检</h1><ol><li><a href="one">第一章</a></li><li><a href="two">第二章</a></li></ol>'
+                        text = '<h1>通用下载自检</h1><ol><li><a href="demo-1.html">第一章</a></li><li><a href="demo-2.html">第二章</a></li></ol>'
+                    elif self.path == "/book/demo-1.html":
+                        text = '<h1>第一章</h1><article><p>连字符分页前半段。</p></article><a href="demo-1-2.html">下一页 »</a>'
+                    elif self.path == "/book/demo-1-2.html":
+                        text = '<h1>第一章</h1><article><p>连字符分页后半段。</p></article><a href="demo-2.html">下一章 »</a>'
+                    elif self.path == "/book/demo-2.html":
+                        encoded = base64.b64encode('<p>静态编码前半段。</p>'.encode("utf-8")).decode("ascii")
+                        text = '<h1>第二章（第1页）</h1><article><script>document.writeln(qsbs.bb(\'' + encoded + '\'));</script></article><a href="demo-2_1.html">下一章</a>'
+                    elif self.path == "/book/demo-2_1.html":
+                        text = '<h1>第二章（第2页）</h1><article><p>误标下一章的后半段。</p></article>'
                     else:
-                        text = '<article><p>这是本地服务器提供的章节正文。</p></article>'
+                        self.send_error(404)
+                        return
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.end_headers()
@@ -89,8 +100,12 @@ def run(output_directory):
                 result = downloader.download(f"http://127.0.0.1:{server.server_port}/book/")
                 assert result.chapter_count == 2
                 assert len(ReaderLogic().get_chapters(result.file_path)) == 2
+                downloaded_text = Path(result.file_path).read_text(encoding="utf-8")
+                for fragment in ("连字符分页前半段。", "连字符分页后半段。", "静态编码前半段。", "误标下一章的后半段。"):
+                    assert fragment in downloaded_text
                 assert downloader.charset
                 checks["http_download_and_chapter_index"] = True
+                checks["multi_page_chapters"] = True
             finally:
                 server.shutdown()
                 server.server_close()

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -196,7 +198,7 @@ def _dpapi_unprotect(data: bytes) -> bytes:
         kernel32.LocalFree(blob_out.pbData)
 
 
-def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) -> bytes:
+def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, language: str = "CN") -> bytes:
     algorithm = ctypes.c_void_p()
     key_handle = ctypes.c_void_p()
     key_object = None
@@ -204,6 +206,7 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) ->
         _check_status(
             bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(algorithm), BCRYPT_AES_ALGORITHM, None, 0),
             "BCryptOpenAlgorithmProvider",
+            language=language,
         )
 
         chaining_mode = ctypes.create_unicode_buffer(BCRYPT_CHAIN_MODE_GCM)
@@ -216,6 +219,7 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) ->
                 0,
             ),
             "BCryptSetProperty",
+            language=language,
         )
 
         object_length = wintypes.ULONG()
@@ -230,6 +234,7 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) ->
                 0,
             ),
             "BCryptGetProperty",
+            language=language,
         )
 
         key_object = ctypes.create_string_buffer(object_length.value)
@@ -245,6 +250,7 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) ->
                 0,
             ),
             "BCryptGenerateSymmetricKey",
+            language=language,
         )
 
         nonce_buffer = ctypes.create_string_buffer(nonce, len(nonce))
@@ -274,6 +280,7 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) ->
                 0,
             ),
             "BCryptDecrypt(size)",
+            language=language,
         )
 
         output_buffer = ctypes.create_string_buffer(output_length.value)
@@ -302,14 +309,24 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) ->
             bcrypt.BCryptCloseAlgorithmProvider(algorithm, 0)
 
 
-def _decrypt_chromium_value(encrypted_value: bytes, master_key: bytes, language: str = "CN") -> str:
+def _decrypt_chromium_value(encrypted_value: bytes, master_key: bytes, language: str = "CN", host_key: str = "") -> str:
     if not encrypted_value:
         return ""
-    if encrypted_value.startswith((b"v10", b"v11", b"v20")):
+    if encrypted_value.startswith(b"v20"):
+        # 应用绑定加密不能使用旧版主密钥解密，应直接说明导出文件的替代路径。
+        trans = TRANSLATIONS.get(language, TRANSLATIONS["EN"])
+        raise CookieImportError(trans["tag_mismatch"])
+    if encrypted_value.startswith((b"v10", b"v11")):
+        if len(encrypted_value) < 31:
+            raise CookieImportError("Cookie 加密数据不完整。")
         nonce = encrypted_value[3:15]
         ciphertext = encrypted_value[15:-16]
         tag = encrypted_value[-16:]
-        return _aes_gcm_decrypt(master_key, nonce, ciphertext, tag, language).decode("utf-8", errors="ignore")
+        plain = _aes_gcm_decrypt(master_key, nonce, ciphertext, tag, language)
+        # 新版 Chromium 在明文前加上域名哈希，不能把这段二进制数据作为 Cookie 值。
+        if host_key and plain.startswith(hashlib.sha256(host_key.encode("utf-8")).digest()):
+            plain = plain[32:]
+        return plain.decode("utf-8", errors="strict")
     return _dpapi_unprotect(encrypted_value).decode("utf-8", errors="ignore")
 
 
@@ -372,6 +389,20 @@ def _build_cookie_header(cookie_pairs: dict[str, str]) -> str:
     return "; ".join(f"{name}={value}" for name, value in cookie_pairs.items() if value)
 
 
+def _domain_matches(cookie_domain: str, hostname: str, host_only: bool = False) -> bool:
+    if not isinstance(cookie_domain, str):
+        return False
+    domain = cookie_domain.lstrip(".").lower().rstrip(".")
+    hostname = hostname.lower().rstrip(".")
+    return bool(domain and (hostname == domain or (not host_only and hostname.endswith("." + domain))))
+
+
+def _cookie_hosts(hostname: str) -> list[str]:
+    parts = hostname.lower().rstrip(".").split(".")
+    return [prefix + ".".join(parts[index:])
+            for index in range(max(1, len(parts) - 1)) for prefix in ("", ".")]
+
+
 def import_chromium_cookies(browser: str, domain: str, language: str = "CN") -> ImportedCookieJar:
     source = CHROMIUM_SOURCES.get(browser)
     if not source:
@@ -389,24 +420,27 @@ def import_chromium_cookies(browser: str, domain: str, language: str = "CN") -> 
     profile_path = ""
 
     for profile, db_path in _iter_chromium_cookie_dbs(user_data_dir):
+        hosts = _cookie_hosts(domain)
         rows = _query_sqlite_rows(
             db_path,
-            """
-            SELECT name, value, encrypted_value
+            f"""
+            SELECT host_key, name, value, encrypted_value
             FROM cookies
-            WHERE host_key LIKE ?
+            WHERE host_key IN ({','.join('?' for _ in hosts)})
             ORDER BY LENGTH(host_key) DESC, last_access_utc DESC
             """,
-            (f"%{domain}%",),
+            tuple(hosts),
             language,
         )
         if not rows:
             continue
 
-        for name, value, encrypted_value in rows:
+        for host_key, name, value, encrypted_value in rows:
+            if not _domain_matches(host_key, domain, not host_key.startswith(".")):
+                continue
             if name in collected:
                 continue
-            plain_value = value or _decrypt_chromium_value(encrypted_value, master_key, language)
+            plain_value = value or _decrypt_chromium_value(encrypted_value, master_key, language, host_key)
             if plain_value:
                 collected[name] = plain_value
 
@@ -438,21 +472,24 @@ def import_firefox_cookies(domain: str, language: str = "CN") -> ImportedCookieJ
         if not db_path.exists():
             continue
 
+        hosts = _cookie_hosts(domain)
         rows = _query_sqlite_rows(
             db_path,
-            """
-            SELECT name, value
+            f"""
+            SELECT host, name, value
             FROM moz_cookies
-            WHERE host LIKE ?
+            WHERE host IN ({','.join('?' for _ in hosts)})
             ORDER BY LENGTH(host) DESC, lastAccessed DESC
             """,
-            (f"%{domain}%",),
+            tuple(hosts),
             language,
         )
         if not rows:
             continue
 
-        for name, value in rows:
+        for host, name, value in rows:
+            if not _domain_matches(host, domain, not host.startswith(".")):
+                continue
             if name not in collected and value:
                 collected[name] = value
 
@@ -495,27 +532,45 @@ def import_cookies_from_file(file_path: str, domain: str, language: str = "CN") 
         trans = TRANSLATIONS.get(language, TRANSLATIONS["EN"])
         raise CookieImportError(trans["read_failed"].format(error=e))
 
-    # Try JSON first
+    # 保留 HttpOnly 行与父域 Cookie，按域名边界匹配，不能误收相似域名。
     try:
         data = json.loads(content)
+        if isinstance(data, dict):
+            data = data.get("cookies", [])
         if isinstance(data, list):
             for entry in data:
+                if not isinstance(entry, dict):
+                    continue
                 cookie_domain = entry.get("domain", "")
-                if domain in cookie_domain:
+                expiry = entry.get("expirationDate", entry.get("expires", 0))
+                try:
+                    if float(expiry or 0) > 0 and float(expiry) <= time.time():
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if _domain_matches(cookie_domain, domain, entry.get("hostOnly") is True):
                     name = entry.get("name")
                     value = entry.get("value")
-                    if name and value:
+                    if isinstance(name, str) and isinstance(value, str) and name and value:
                         collected[name] = value
     except (json.JSONDecodeError, TypeError):
-        # Not JSON, try Netscape format or custom key-value
+        # 非 JSON 时兼容 Netscape 文件和手工复制的 Cookie 请求头。
         for line in content.splitlines():
             line = line.strip()
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
             if not line or line.startswith("#"):
                 continue
             parts = line.split("\t")
             if len(parts) >= 7:
                 cookie_domain = parts[0]
-                if domain in cookie_domain:
+                try:
+                    expiry = float(parts[4])
+                except ValueError:
+                    continue
+                if expiry > 0 and expiry <= time.time():
+                    continue
+                if _domain_matches(cookie_domain, domain, parts[1].upper() != "TRUE"):
                     name = parts[5]
                     value = parts[6]
                     if name and value:

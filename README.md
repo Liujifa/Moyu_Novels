@@ -27,7 +27,7 @@
 
 ### 方式一：下载免安装包（推荐）
 
-1. 打开 [Releases](https://github.com/Liujifa/Mess-Around/releases/latest)，下载 `MoYuReader-v1.0.0-Windows-x64.zip`。
+1. 打开 [Releases](https://github.com/Liujifa/Mess-Around/releases/latest)，下载 `MoYuReader-v1.0.1-Windows-x64.zip`。
 2. 完整解压 ZIP 到本地目录，双击 `MoYuReader.exe`。请保留旁边的 `_internal` 文件夹，不要在压缩软件内部运行。
 3. 启动后直接显示书库。导入 TXT 或从网页下载，选择章节后点击 **开始阅读**。
 
@@ -85,6 +85,8 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 
 相对链接使用重定向后的页面地址解析。目录保留原站顺序，仅在编号明确连续倒序时反转，避免打乱多卷重编号或特殊章节。普通 TXT 的分章仍依赖标题识别，可能需要人工校对。
 
+**一章多页：** 支持 `章节_1.html`、`书籍-章节-2.html`、查询参数等分页形式。部分站点把后半页按钮写作“下一章”，下载器会结合 URL 中的章节标识判断；真正的下一章不会并入当前章。翻页后的章节标题改变、正文缺失或分页循环时会报告失败。页面内特定 `document.write(atob(...))` / `document.writeln(qsbs.bb(...))` 静态 Base64 段落可直接解码，不执行任意 JavaScript。
+
 原有字符解码及个别站点的兼容回退继续保留，通用目录发现不依赖这些适配。没有找到目录时，下载器会明确提示尝试下载当前阅读页；不会把单页下载描述为整本下载。
 
 ### 高级解析规则
@@ -104,6 +106,8 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 
 **动态页面的边界：** 程序不会运行任意 JavaScript。如果正文只在浏览器执行脚本后才出现，原始 HTML 和内嵌 JSON 均不含正文，需要提供可访问的数据接口或另行使用浏览器渲染。CSS 规则无法提取响应中不存在的数据；登录、验证码和接口鉴权也可能限制下载。
 
+若目录通过脚本加载后续章节，且分页控件只提供数字参数、没有真实分页链接，程序会提示目录尚未读全。mopbook 当前详情页属于这种情况：单章分页已修复，但整本目录的动态加载尚未支持，不能把页面初始显示的 100 章当作全书。具体样本与验证范围见 [分页验证记录](docs/pagination-verification.md)。
+
 ### 完整性、重试与取消
 
 - 通用下载使用共享限速；收到 HTTP 429 时统一冷却，降低请求频率。
@@ -111,12 +115,15 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 - 已完成章节保存在 `novel_downloads/.chapter_cache/`。使用同一地址重新下载可复用有效缓存；完整保存成功后清理本次缓存。
 - 点击取消，或下载时从托盘退出，都会先请求取消，再等待当前网络请求和工作线程结束。
 - 正文清洗会保留包含“收藏、评论”等词的正常段落，以及作者有意重复的段落。旧版清洗缓存会失效并重新抓取，已保存的 TXT 不会自动改写。
+- v1.0.1 更新章节缓存版本，避免重试时复用旧版漏掉后半页的章节缓存。此前已成功保存的半章 TXT 需要重新下载；不会自动覆盖已有文件。
 
 ### Cookie 导入
 
 部分站点需要登录状态。下载对话框支持尝试从 Edge、Chrome、Firefox 导入 Cookie，也支持导入导出的 JSON / Netscape Cookie 文件。
 
 遇到 403 时，先在浏览器中确认该页面能够正常访问，再按 [Cookie 导出说明](cookie_export_guide.md) 导入对应站点的 Cookie。浏览器加密方式、文件占用及站点访问策略都可能影响导入结果。
+
+有些验证页返回 HTTP 200，程序也会识别并停止，避免保存验证码页面。文件导入支持父域匹配及 Netscape 的 `#HttpOnly_` 条目；过期或域名不匹配的 Cookie 不会导入。Chrome / Edge 的应用绑定加密仍需要导出文件，不能保证只导入 Cookie 就能满足站点的所有浏览器环境校验。
 
 ## 数据与备份
 
@@ -172,13 +179,14 @@ python -m unittest discover -v
 
 - 选章优先级、长篇延迟布局、同名书籍与 Unicode 偏移；
 - 目录分页、正文清洗、缺章重试、缓存续传和索引校验；
+- 连字符正文分页、误标“下一章”的后半页、静态 Base64 段落、分页标题校验及旧半章缓存失效；
 - 任意域名目录发现、多卷与无编号章节、HTML / JSON / TXT、重定向、手动规则及规则向工作线程传递；
 - 下载线程取消、重试与托盘安全退出；
 - 书库原子保存、磁盘故障回滚、旧数据兼容与损坏文件保护；
 - 文档复用、目录动作释放和读取失败后的状态保留。
 - 书库搜索、空状态、语言切换后的手动选章、短窗口表单滚动，以及发布版数据目录隔离。
 
-其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖审查中发现的异常路径，`test_generic_downloader.py` 覆盖通用解析与下载规则，`test_ui_release.py` 覆盖界面与发布路径。
+其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖异常路径，`test_generic_downloader.py` 覆盖通用解析规则，`test_ui_release.py` 覆盖界面与发布路径，`test_chapter_pagination.py` 覆盖多页章节，`test_cookie_regressions.py` 覆盖 Cookie 导入及验证页保护。
 
 ### 构建 Windows 发布包
 
