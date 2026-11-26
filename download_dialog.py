@@ -39,6 +39,9 @@ TRANSLATIONS = {
         "close": "\u5173\u95ed",
         "status_idle": "\u7b49\u5f85\u5f00\u59cb",
         "logs": "下载日志",
+        "speed": "下载速度",
+        "speed_auto": "自动降速（记住本站限流情况）",
+        "speed_conservative": "慢速稳定（单路，至少 6 秒一次请求）",
         "cancel": "取消下载",
         "rules": "高级解析规则（可选）",
         "rules_hint": "留空自动识别。自动解析不准确时，可填写 CSS 选择器指定页面区域；仅用于本次下载。",
@@ -62,6 +65,9 @@ TRANSLATIONS = {
         "close": "Close",
         "status_idle": "Waiting to start",
         "logs": "Download Log",
+        "speed": "Download speed",
+        "speed_auto": "Adaptive (remember site limits)",
+        "speed_conservative": "Conservative (one request at least every 6s)",
         "cancel": "Cancel",
         "rules": "Advanced Extraction Rules (Optional)",
         "rules_hint": "Leave blank for automatic detection. CSS selectors can specify page regions when needed; rules apply to this download only.",
@@ -79,10 +85,11 @@ TRANSLATIONS = {
 class DownloadWorker(QObject):
     progress = pyqtSignal(int, int, str, str)
     log = pyqtSignal(str)
+    status = pyqtSignal(str)
     finished = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, url: str, title: str, browser: str, download_dir: str, language: str = "CN", extraction_rules=None):
+    def __init__(self, url: str, title: str, browser: str, download_dir: str, language: str = "CN", extraction_rules=None, request_mode="auto"):
         super().__init__()
         self.url = url
         self.title = title
@@ -90,6 +97,7 @@ class DownloadWorker(QObject):
         self.download_dir = download_dir
         self.language = language
         self.extraction_rules = dict(extraction_rules or {})
+        self.request_mode = request_mode
         self.downloader = None
         self._abort_requested = False
 
@@ -101,6 +109,8 @@ class DownloadWorker(QObject):
                 log_callback=self.log.emit,
                 language=self.language,
                 extraction_rules=self.extraction_rules,
+                request_mode=self.request_mode,
+                status_callback=self.status.emit,
             )
             self.downloader.is_cancelled = self._abort_requested
             result = self.downloader.download(self.url, self.title, self.browser)
@@ -183,6 +193,10 @@ class WebDownloadDialog(QDialog):
         form.addRow(self.t("url"), self.url_input)
         form.addRow(self.t("name"), self.title_input)
         form.addRow(self.t("browser"), self.browser_combo)
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItem(self.t("speed_auto"), "auto")
+        self.speed_combo.addItem(self.t("speed_conservative"), "conservative")
+        form.addRow(self.t("speed"), self.speed_combo)
         layout.addLayout(form)
 
         self.rules_group = QGroupBox(self.t("rules"))
@@ -260,6 +274,7 @@ class WebDownloadDialog(QDialog):
         self.url_input.setEnabled(False)
         self.title_input.setEnabled(False)
         self.browser_combo.setEnabled(False)
+        self.speed_combo.setEnabled(False)
         self.rules_group.setEnabled(False)
 
         browser = self.browser_combo.currentData()
@@ -274,6 +289,7 @@ class WebDownloadDialog(QDialog):
                 self.url_input.setEnabled(True)
                 self.title_input.setEnabled(True)
                 self.browser_combo.setEnabled(True)
+                self.speed_combo.setEnabled(True)
                 self.rules_group.setEnabled(True)
                 return
             browser = file_path # Pass the path as the "browser" param
@@ -285,6 +301,7 @@ class WebDownloadDialog(QDialog):
             browser=browser,
             download_dir=self.download_dir,
             language=self.language,
+            request_mode=self.speed_combo.currentData(),
             extraction_rules={key: field.text().strip() for key, field in self.rule_inputs.items()
                               if self.rules_group.isChecked() and field.text().strip()},
         )
@@ -293,6 +310,7 @@ class WebDownloadDialog(QDialog):
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.append_log)
+        self.worker.status.connect(self.status_label.setText)
         self.worker.finished.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
         self.worker.finished.connect(self.thread.quit)
@@ -358,6 +376,7 @@ class WebDownloadDialog(QDialog):
         self.url_input.setEnabled(True)
         self.title_input.setEnabled(True)
         self.browser_combo.setEnabled(True)
+        self.speed_combo.setEnabled(True)
         self.rules_group.setEnabled(True)
 
     def show_export_help(self):

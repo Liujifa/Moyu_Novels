@@ -119,7 +119,7 @@ class NovelPageParser:
         scope = urlparse(link_base).path.rpartition("/")[0].rstrip("/")
 
         # 行级章节标记是结构证据，不依赖域名、目录路径或章节标题格式。
-        marked = soup.select("[chapter-id], [data-chapter-id]")
+        marked = soup.select("[chapter-id], [data-chapter-id], li[data-index-id]")
         if marked:
             entries = self.coherent(self.anchors(link_base, marked, True), scope)
             if entries:
@@ -227,8 +227,6 @@ class NovelPageParser:
         if "catalog_link_selector" in self.rules:
             nodes = self.select_rule("catalog_link_selector", soup)
             return next((self.link(url, node.get("href")) for node in nodes if self.link(url, node.get("href"))), url)
-        if self.catalog_links(url, soup):
-            return url
         candidates = []
         for node in soup.select("a[href], link[rel][href]"):
             target = self.link(url, node.get("href"))
@@ -250,13 +248,23 @@ class NovelPageParser:
             if label in {"阅读", "开始阅读", "立即阅读", "read", "read now", "start reading"} or label.endswith("全文阅读"):
                 score += 4
             if score >= 2:
-                candidates.append((score, len(path), target))
+                complete = bool(re.search(r"(?:全部|完整|所有)(?:目录|章节)|(?:full|all)\s+(?:chapters|contents)", label))
+                candidates.append((score, len(path), target, complete))
+        # 详情页经常只列出最新几章，明确的完整目录入口应先于当前页的章节分组。
+        complete = [item for item in candidates if item[3]]
+        if complete and "chapter_link_selector" not in self.rules:
+            return sorted(complete, key=lambda item: (-item[0], item[1]))[0][2]
+        if self.catalog_links(url, soup):
+            return url
         return sorted(candidates, key=lambda item: (-item[0], item[1]))[0][2] if candidates else url
 
     @classmethod
     def pagination_identity(cls, url):
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
+        # 同一目录的首页与后续页可能采用两种路由，必须保留书籍 ID 后再归一化。
+        path = re.sub(r"/index[-_]?list[-/](\d+)(?:/\d+)?\.(?:html?|php)$",
+                      r"/indexlist/\1", path, flags=re.I)
         path = re.sub(r"/(catalog|chapters|contents|toc|list)/\d+$", r"/\1", path, flags=re.I)
         path = re.sub(r"/(?:index(?:[_-]\d+)?|[01]_\d+)\.(?:html?|php)$", "", path, flags=re.I)
         path = re.sub(r"/page/\d+$", "", path, flags=re.I)

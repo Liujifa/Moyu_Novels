@@ -374,7 +374,7 @@ class DownloaderBehaviorTests(unittest.TestCase):
 
     def test_cancellation_interrupts_rate_limit_wait(self):
         self.downloader.is_cancelled = True
-        self.downloader._cooldown_until = time.monotonic() + 60
+        self.downloader._request_profile("").cooldown_until = time.monotonic() + 60
         started = time.monotonic()
         with self.assertRaises(WebDownloadError):
             self.downloader._wait_for_request_slot()
@@ -431,19 +431,15 @@ class DownloaderBehaviorTests(unittest.TestCase):
             ],
         )
 
-    def test_rate_limiter_slows_down_and_recovers(self):
+    def test_rate_limiter_retains_conservative_interval(self):
         default_interval = self.downloader.DEFAULT_REQUEST_INTERVAL
         self.downloader._register_rate_limit(2.0)
 
-        slowed_interval = self.downloader._request_interval
+        profile = self.downloader._request_profile("")
+        slowed_interval = profile.interval
         self.assertGreater(slowed_interval, default_interval)
-        self.assertGreater(self.downloader._cooldown_until, time.monotonic())
-
-        for _ in range(self.downloader.RATE_LIMIT_SUCCESS_WINDOW):
-            self.downloader._register_request_success()
-
-        self.assertLess(self.downloader._request_interval, slowed_interval)
-        self.assertGreaterEqual(self.downloader._request_interval, default_interval)
+        self.assertGreater(profile.cooldown_until, time.monotonic())
+        self.assertGreaterEqual(slowed_interval, self.downloader.CONSERVATIVE_REQUEST_INTERVAL)
 
 
 class ChapterIndexTests(unittest.TestCase):

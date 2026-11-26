@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import QApplication
 from download_dialog import WebDownloadDialog
 from reader_logic import ReaderLogic
 from requests import Response
-from web_novel_downloader import WebDownloadError, WebNovelDownloader
+from web_novel_downloader import ChapterLink, WebDownloadError, WebNovelDownloader, WebRateLimitError
 
 
 class GenericDownloaderTests(unittest.TestCase):
@@ -40,6 +40,38 @@ class GenericDownloaderTests(unittest.TestCase):
 
     def catalog(self, html, url="https://unlisted.example/story/alpha/index.html"):
         return self.downloader.extract_chapter_links(url, self.soup(html))
+
+    def test_mobile_directory_download_repairs_duplicate_and_follows_numeric_paths(self):
+        root = "https://unlisted.example/12345/"
+        picker = ('<select id="indexselect"><option value="/12345/">1 - 2章</option>'
+                  '<option value="/12345/2/">3 - 4章</option></select>')
+        shell = ('<div class="recommend"><div id="chapterlist" class="directoryArea">'
+                 '<a href="/12345/999.html">第99章 推荐</a></div>'
+                 '<div class="directoryArea">{entries}</div>' + picker + '</div>')
+        self.pages({
+            root: shell.format(entries='<a href="/12345/10.html">第一章 甲</a><a href="/12345/10.html">第二章 乙</a>'),
+            root + "2/": shell.format(entries='<a href="/12345/30.html">第三章 丙</a><a href="/12345/40.html">第四章 丁</a>'),
+            root + "10.html": '<title>第一章 甲_测试小说_网页</title><article>第一章的内容</article>',
+            root + "20.html": ('<title>第二章 乙_测试小说_网页</title><span class="title">测试小说</span>'
+                               '<a href="10.html">上一章</a><article>第二章的内容</article>'),
+            root + "30.html": ('<title>第三章 丙_测试小说_网页</title>'
+                               '<a href="20.html">上一章</a><article>第三章的内容</article>'),
+            root + "40.html": '<title>第四章 丁_测试小说_网页</title><article>第四章的内容</article>',
+        })
+        result = self.downloader.download(root, title_override="测试小说")
+        chapters = ReaderLogic().get_chapters(result.file_path)
+        self.assertEqual(result.chapter_count, 4)
+        self.assertEqual([chapter["title"] for chapter in chapters], ["第一章 甲", "第二章 乙", "第三章 丙", "第四章 丁"])
+        self.assertIn("第二章的内容", Path(result.file_path).read_text(encoding="utf-8"))
+        self.assertNotIn(root + "999.html", self.calls)
+
+    def test_mobile_directory_with_incomplete_page_does_not_save_one_chapter(self):
+        root = "https://unlisted.example/12345/"
+        self.pages({root: ('<div class="recommend"><div class="directoryArea"><a href="10.html">第一章</a></div>'
+                           '<select id="indexselect"><option value="/12345/">1 - 2章</option></select></div>')})
+        with self.assertRaisesRegex(WebDownloadError, "目录第 1 页缺少有效章节"):
+            self.downloader.download(root)
+        self.assertEqual(list(Path(self.temporary.name).glob("*.txt")), [])
 
     def test_two_unnumbered_chapters_in_unknown_container(self):
         links = self.catalog('<div class="x91"><ul><li><a href="dawn.html">黎明之前</a></li>'
@@ -217,6 +249,63 @@ class GenericDownloaderTests(unittest.TestCase):
                          '<a class="full" href="contents.html">全部章节</a>')
         self.assertEqual(self.downloader.resolve_catalog_url(source, soup), source + "contents.html")
 
+    def test_full_catalog_entry_precedes_latest_chapters(self):
+        source = "https://any.example/book/123.html"
+        html = ('<div class="chapters"><a href="123/99.html">第99章</a>'
+                '<a href="123/100.html">第100章</a></div>'
+                '<a href="indexList-123.html">全部目录</a>')
+        self.assertEqual(self.downloader.resolve_catalog_url(source, self.soup(html)),
+                         "https://any.example/book/indexList-123.html")
+        self.downloader.parser.rules["chapter_link_selector"] = ".chapters a"
+        self.assertEqual(self.downloader.resolve_catalog_url(source, self.soup(html)), source)
+
+    def test_persistent_rate_limit_stops_nested_retries_and_other_requests(self):
+        response = Response()
+        response.status_code = 429
+        response._content = b"Too many requests"
+        with patch.object(self.downloader, "_wait_for_request_slot"), \
+                patch.object(self.downloader.session, "get", return_value=response) as request:
+            with self.assertRaisesRegex(WebRateLimitError, "HTTP 429"):
+                self.downloader.fetch_chapter_page_content("https://any.example/chapter/1")
+        self.assertEqual(request.call_count, 5)
+        with self.assertRaises(WebRateLimitError):
+            self.downloader._wait_for_request_slot()
+
+    def test_persistent_rate_limit_cancels_queued_chapters_without_saving(self):
+        self.downloader.MAX_WORKERS = 1
+        response = Response()
+        response.status_code = 429
+        response._content = b"Too many requests"
+        chapters = [ChapterLink(f"第{i}章", f"https://any.example/{i}.html", i) for i in range(50)]
+        with patch.object(self.downloader, "_register_rate_limit", return_value=0), \
+                patch.object(self.downloader.session, "get", return_value=response) as request:
+            with self.assertRaises(WebRateLimitError):
+                self.downloader.download_chapter_batch(chapters)
+        self.assertEqual(request.call_count, 5)
+        self.assertEqual(list(Path(self.temporary.name).glob("*.txt")), [])
+
+    def test_index_list_routes_download_all_pages_without_metadata_links(self):
+        source = "https://any.example/book/123.html"
+        catalog = "https://any.example/book/indexList-123.html"
+        following = "https://any.example/book/indexList/123/2.html"
+        metadata = '<a href="bookclass.html">分类</a><a href="bookclass.html?k=作者">作者</a>'
+        first = (metadata + '<h1>分页小说</h1><h3>共3章</h3><ul id="bookIndexList">'
+                 '<li data-index-id="10"><a href="123/10.html">第一章</a></li>'
+                 '<li data-index-id="20"><a href="123/20.html">第二章</a></li></ul>'
+                 '<div id="indexPager"><a href="indexList/123/2.html">下一页</a></div>')
+        second = (metadata + '<ul id="bookIndexList"><li data-index-id="30">'
+                  '<a href="/book/123/30.html">第三章</a></li></ul>')
+        self.pages({source: '<h1>分页小说</h1><a href="indexList-123.html">全部目录</a>'
+                    '<div class="chapters"><a href="123/20.html">第二章</a><a href="123/30.html">第三章</a></div>',
+                    catalog: first, following: second,
+                    **{f"https://any.example/book/123/{i}0.html": f'<h1>第{i}章</h1><article>正文{i}。</article>'
+                       for i in range(1, 4)}})
+        result = self.downloader.download(source)
+        self.assertEqual(result.chapter_count, 3)
+        self.assertEqual(len(ReaderLogic().get_chapters(result.file_path)), 3)
+        self.assertFalse(self.downloader.parser.catalog_pagination_candidate(
+            catalog, "https://any.example/book/indexList/456/2.html"))
+
     def test_select_option_catalog_pagination(self):
         source = "https://novels.example/alpha/"
         following = source + "index_2.html"
@@ -309,10 +398,12 @@ class GenericRulesDialogTests(unittest.TestCase):
             dialog.url_input.setText("https://unknown.example/")
             dialog.rules_group.setChecked(True)
             dialog.rule_inputs["content_selector"].setText("#body")
+            dialog.speed_combo.setCurrentIndex(1)
             received = []
 
             def download(downloader, *_args):
-                received.append(downloader.parser.rules.copy())
+                received.append((downloader.parser.rules.copy(), downloader.request_mode, downloader.MAX_WORKERS))
+                downloader.status_callback("正在等待站点解除限流")
                 return downloader._save_txt("规则测试", [("第一章", "正文内容。")], "https://unknown.example/")
 
             with patch.object(WebNovelDownloader, "download", download), patch("download_dialog.QMessageBox.information"):
@@ -322,7 +413,7 @@ class GenericRulesDialogTests(unittest.TestCase):
                 while dialog.thread is not None and time.monotonic() < deadline:
                     QTest.qWait(20)
                 self.assertIsNone(dialog.thread)
-                self.assertEqual(received, [{"content_selector": "#body"}])
+                self.assertEqual(received, [({"content_selector": "#body"}, "conservative", 1)])
 
 
 if __name__ == "__main__":

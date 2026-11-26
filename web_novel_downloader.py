@@ -5,12 +5,14 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import os
 import re
 import threading
 import tempfile
 import time
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qs, unquote, urlencode, urldefrag, urljoin, urlparse, urlunparse
@@ -27,6 +29,7 @@ except ImportError as exc:
 from browser_cookie_importer import CookieImportError, import_browser_cookies
 from novel_page_parser import NovelPageParser
 from ajax_catalog import CatalogProtocolError, load_encrypted_catalog
+from mobile_directory import is_mobile_directory, load_mobile_directory
 
 TRANSLATIONS = {
     "CN": {
@@ -71,13 +74,28 @@ class WebDownloadError(RuntimeError):
     pass
 
 
+class WebRateLimitError(WebDownloadError):
+    pass
+
+
+@dataclass
+class RequestProfile:
+    interval: float
+    next_request: float = 0.0
+    cooldown_until: float = 0.0
+    in_flight: int = 0
+    penalties: int = 0
+
+
 class WebNovelDownloader:
     FANQIE_DOMAIN = "fanqienovel.com"
     CODE = ((58344, 58715), (58345, 58716))
     MAX_WORKERS = 3
-    DEFAULT_REQUEST_INTERVAL = 0.3
-    MAX_REQUEST_INTERVAL = 3.0
-    RATE_LIMIT_SUCCESS_WINDOW = 20
+    DEFAULT_REQUEST_INTERVAL = 1.0
+    CONSERVATIVE_REQUEST_INTERVAL = 6.0
+    MAX_REQUEST_INTERVAL = 60.0
+    RATE_LIMIT_COOLDOWN = 60.0
+    MAX_RATE_LIMIT_COOLDOWN = 900.0
     MAX_CONTENT_RETRIES = 3
     MAX_CATALOG_PAGES = 200
     MAX_CHAPTER_PAGES = 24
@@ -214,6 +232,8 @@ class WebNovelDownloader:
         log_callback: LogCallback = None,
         language: str = "CN",
         extraction_rules: Optional[dict[str, str]] = None,
+        request_mode: str = "auto",
+        status_callback: LogCallback = None,
     ):
         if IMPORT_ERROR is not None or requests is None or BeautifulSoup is None:
             raise WebDownloadError(
@@ -224,14 +244,19 @@ class WebNovelDownloader:
         self.progress_callback = progress_callback
         self.log_callback = log_callback
         self.language = language
+        if request_mode not in {"auto", "conservative"}:
+            raise WebDownloadError("不支持的下载速度模式。")
+        self.request_mode = request_mode
+        self.status_callback = status_callback
         self.is_cancelled = False
         self._used_chapter_cache = set()
         self._response_state = threading.local()
         self._rate_limit_lock = threading.Lock()
-        self._next_request_time = 0.0
-        self._cooldown_until = 0.0
-        self._request_interval = self.DEFAULT_REQUEST_INTERVAL
-        self._success_streak = 0
+        self._request_profiles = {}
+        self._last_wait_status = 0.0
+        self._rate_limit_error = ""
+        if request_mode == "conservative":
+            self.MAX_WORKERS = 1
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -269,6 +294,7 @@ class WebNovelDownloader:
         if self.is_cancelled:
             raise WebDownloadError("下载已取消。")
         self._used_chapter_cache.clear()
+        self._rate_limit_error = ""
         normalized_url = self.normalize_url(url)
         hostname = (urlparse(normalized_url).hostname or "").lower()
 
@@ -477,6 +503,8 @@ class WebNovelDownloader:
         return self._save_txt(book_title, chapters, catalog_url)
 
     def resolve_catalog_url(self, url: str, soup: BeautifulSoup) -> str:
+        if self._uses_mobile_directory(url, soup):
+            return url
         target = self.parser.catalog_target(url, soup)
         if target != url or self.parser.catalog_links(url, soup):
             return target
@@ -536,6 +564,10 @@ class WebNovelDownloader:
                     try:
                         downloaded[chapter.index] = future.result()
                         self._used_chapter_cache.add(self._chapter_cache_path(chapter.url))
+                    except WebRateLimitError:
+                        for queued in future_map:
+                            queued.cancel()
+                        raise
                     except Exception as exc:
                         failed.append(chapter)
                         self.log(f"章节下载失败：{chapter.title}，原因：{exc}")
@@ -663,6 +695,8 @@ class WebNovelDownloader:
         for attempt in range(self.MAX_CONTENT_RETRIES):
             try:
                 html = self.fetch_html(url, referer=referer)
+            except WebRateLimitError:
+                raise
             except Exception as exc:
                 if self.is_cancelled:
                     raise WebDownloadError("下载已取消。") from exc
@@ -703,48 +737,117 @@ class WebNovelDownloader:
             return last_content, last_title, last_next_page
         return "", last_title, last_next_page
 
-    def _wait_for_request_slot(self):
+    def _request_profile(self, url):
+        # 调用方持有调度锁；目录、正文和接口共用同一主机的请求额度。
+        host = (urlparse(url).netloc or "").lower()
+        if host not in self._request_profiles:
+            interval = (self.CONSERVATIVE_REQUEST_INTERVAL if self.request_mode == "conservative"
+                        else self.DEFAULT_REQUEST_INTERVAL)
+            profile = RequestProfile(interval)
+            if host:
+                try:
+                    saved = json.loads(self._request_profile_path(host).read_text(encoding="utf-8"))
+                    saved_interval = float(saved["interval"])
+                    blocked_until = float(saved["blocked_until"])
+                    updated = float(saved["updated"])
+                    penalties = saved["penalties"]
+                    if (saved.get("version") == 1 and saved.get("host") == host
+                            and all(math.isfinite(v) for v in (saved_interval, blocked_until, updated))
+                            and 0 < saved_interval <= self.MAX_REQUEST_INTERVAL
+                            and type(penalties) is int and 0 < penalties <= 20
+                            and (time.time() - updated < 7 * 86400 or blocked_until > time.time())):
+                        profile.interval = max(interval, saved_interval)
+                        profile.penalties = penalties
+                        profile.cooldown_until = time.monotonic() + max(0.0, blocked_until - time.time())
+                except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                    pass
+            self._request_profiles[host] = profile
+        return self._request_profiles[host]
+
+    def _request_profile_path(self, host):
+        key = hashlib.sha256(host.encode("utf-8")).hexdigest()
+        return Path(self.download_dir) / ".request_pacing" / f"{key}.json"
+
+    def _save_request_profile(self, url, profile):
+        host = (urlparse(url).netloc or "").lower()
+        if not host:
+            return
+        path = self._request_profile_path(host)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_json_atomic(path, {
+                "version": 1, "host": host, "interval": profile.interval,
+                "penalties": profile.penalties, "updated": time.time(),
+                "blocked_until": time.time() + max(0.0, profile.cooldown_until - time.monotonic()),
+            })
+        except OSError as exc:
+            self.log(f"保存站点降速记录失败，本次仍按降速策略运行：{exc}")
+
+    def _wait_for_request_slot(self, url=""):
         while True:
             if self.is_cancelled:
                 raise WebDownloadError("下载已取消。")
+            status = ""
             with self._rate_limit_lock:
+                if self._rate_limit_error:
+                    raise WebRateLimitError(self._rate_limit_error)
+                profile = self._request_profile(url)
                 now = time.monotonic()
-                ready_at = max(self._next_request_time, self._cooldown_until)
-                if now >= ready_at:
-                    self._next_request_time = now + self._request_interval
+                ready_at = max(profile.next_request, profile.cooldown_until)
+                serialized = profile.penalties > 0 or self.request_mode == "conservative"
+                if now >= ready_at and not (serialized and profile.in_flight):
+                    profile.next_request = now + profile.interval
+                    profile.in_flight += 1
                     return
-                delay = ready_at - now
-
+                delay = max(0.01, ready_at - now)
+                if profile.cooldown_until > now and now - self._last_wait_status >= 1.0:
+                    self._last_wait_status = now
+                    seconds = math.ceil(profile.cooldown_until - now)
+                    status = (f"站点限流，自动等待 {seconds} 秒后慢速续传（可取消）。" if self.language == "CN"
+                              else f"Rate limited: resuming slowly in {seconds}s (you can cancel).")
+            if status and self.status_callback:
+                self.status_callback(status)
             time.sleep(min(delay, 0.1))
+
+    def _release_request_slot(self, url):
+        with self._rate_limit_lock:
+            profile = self._request_profile(url)
+            profile.in_flight = max(0, profile.in_flight - 1)
+
+    def _stop_for_rate_limit(self, url):
+        # 共享终止状态，避免每个章节再次嵌套重试，持续请求已明确限流的站点。
+        with self._rate_limit_lock:
+            self._rate_limit_error = (f"站点持续返回 HTTP 429（请求过于频繁）：{url}。"
+                                      "已停止本次下载，未生成不完整 TXT；已完成章节已缓存，请稍后重试同一地址。")
+        raise WebRateLimitError(self._rate_limit_error)
 
     def _retry_after_seconds(self, response, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After", "").strip()
         try:
-            return max(1.0, min(60.0, float(retry_after)))
+            value = float(retry_after)
+            if math.isfinite(value) and value >= 0:
+                return value
         except (TypeError, ValueError):
-            return min(30.0, 2.0 * (2 ** attempt))
+            pass
+        try:
+            return max(0.0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return min(self.MAX_RATE_LIMIT_COOLDOWN, self.RATE_LIMIT_COOLDOWN * (2 ** attempt))
 
-    def _register_rate_limit(self, wait_time: float):
+    def _register_rate_limit(self, wait_time: float, url=""):
         with self._rate_limit_lock:
+            profile = self._request_profile(url)
             now = time.monotonic()
-            self._request_interval = min(
-                self.MAX_REQUEST_INTERVAL,
-                max(self.DEFAULT_REQUEST_INTERVAL + 0.2, self._request_interval * 1.6),
-            )
-            self._success_streak = 0
-            self._cooldown_until = max(self._cooldown_until, now + wait_time)
-
-    def _register_request_success(self):
-        with self._rate_limit_lock:
-            self._success_streak += 1
-            if self._success_streak < self.RATE_LIMIT_SUCCESS_WINDOW:
-                return
-
-            self._request_interval = max(
-                self.DEFAULT_REQUEST_INTERVAL,
-                self._request_interval * 0.85,
-            )
-            self._success_streak = 0
+            # 同一批在途请求的 429 合并为一次降速；下一次探测仍失败时再延长冷却。
+            if profile.cooldown_until <= now:
+                profile.penalties = min(20, profile.penalties + 1)
+                profile.interval = min(self.MAX_REQUEST_INTERVAL,
+                                       max(self.CONSERVATIVE_REQUEST_INTERVAL, profile.interval * 2))
+                wait_time = max(wait_time, min(self.MAX_RATE_LIMIT_COOLDOWN,
+                                              self.RATE_LIMIT_COOLDOWN * (2 ** (profile.penalties - 1))))
+            profile.cooldown_until = max(profile.cooldown_until, now + wait_time)
+            self._save_request_profile(url, profile)
+            return profile.cooldown_until - now
 
     def fetch_html(self, url: str, referer: str = "", retry_on_429: bool = True) -> str:
         headers = self.get_headers(url, referer)
@@ -752,22 +855,22 @@ class WebNovelDownloader:
         last_error = None
 
         for attempt in range(max_retries):
-            self._wait_for_request_slot()
+            self._wait_for_request_slot(url)
 
             try:
                 response = self.session.get(url, timeout=30, headers=headers)
 
-                if response.status_code == 429 and retry_on_429:
+                if response.status_code == 429:
                     wait_time = self._retry_after_seconds(response, attempt)
-                    self._register_rate_limit(wait_time)
+                    wait_time = self._register_rate_limit(wait_time, url)
                     last_error = WebDownloadError(f"Server repeatedly rate limited request: {url}")
-                    self.log(f"Rate limited (429) at {url}. Shared cooldown {wait_time:g}s...")
+                    self.log(f"站点返回 HTTP 429，全部请求暂停 {wait_time:.0f} 秒；随后单路慢速续传：{url}")
+                    if attempt == max_retries - 1:
+                        self._stop_for_rate_limit(url)
                     continue
 
                 response.raise_for_status()
                 self._check_verification_response(response, url)
-
-                self._register_request_success()
 
                 if not response.encoding or response.encoding.lower() == 'iso-8859-1':
                     response.encoding = response.apparent_encoding or "utf-8"
@@ -795,6 +898,8 @@ class WebNovelDownloader:
                     time.sleep(min(4.0, 1.0 + attempt))
                     continue
                 raise
+            finally:
+                self._release_request_slot(url)
 
         if last_error:
             raise last_error
@@ -813,7 +918,7 @@ class WebNovelDownloader:
     def post_html(self, url: str, payload: dict, referer: str, extra_headers: Optional[dict] = None) -> str:
         last_error = None
         for attempt in range(3):
-            self._wait_for_request_slot()
+            self._wait_for_request_slot(url)
             try:
                 response = self.session.post(
                     url,
@@ -823,14 +928,15 @@ class WebNovelDownloader:
                 )
                 if response.status_code == 429:
                     wait_time = self._retry_after_seconds(response, attempt)
-                    self._register_rate_limit(wait_time)
+                    wait_time = self._register_rate_limit(wait_time, url)
                     last_error = WebDownloadError(f"Server repeatedly rate limited request: {url}")
-                    self.log(f"Rate limited (429) at {url}. Shared cooldown {wait_time:g}s...")
+                    self.log(f"站点返回 HTTP 429，全部请求暂停 {wait_time:.0f} 秒；随后单路慢速续传：{url}")
+                    if attempt == 2:
+                        self._stop_for_rate_limit(url)
                     continue
 
                 response.raise_for_status()
                 self._check_verification_response(response, url)
-                self._register_request_success()
                 response.encoding = response.apparent_encoding or response.encoding or "utf-8"
                 return response.text
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
@@ -839,6 +945,8 @@ class WebNovelDownloader:
                     time.sleep(1.0 + attempt)
                     continue
                 raise
+            finally:
+                self._release_request_slot(url)
 
         if last_error:
             raise last_error
@@ -863,6 +971,8 @@ class WebNovelDownloader:
             
             dynamic_html = self.post_html(api_url, payload, url)
             return html + f'<div id="ajax-loaded-content">{dynamic_html}</div>'
+        except WebRateLimitError:
+            raise
         except Exception as exc:
             self.log(f"Failed to fetch dynamic AJAX content for {url}: {exc}")
             return html
@@ -924,6 +1034,13 @@ class WebNovelDownloader:
         return self._response_base_url(fallback_url), soup
 
     def extract_chapter_links(self, base_url: str, soup: BeautifulSoup) -> list[ChapterLink]:
+        if self._uses_mobile_directory(base_url, soup):
+            try:
+                entries = load_mobile_directory(self, base_url, soup)
+            except CatalogProtocolError as exc:
+                raise WebDownloadError(str(exc)) from exc
+            return [ChapterLink(self.clean_chapter_title(title), href, index)
+                    for index, (title, href) in enumerate(entries)]
         initial_entries = self.parser.catalog_links(base_url, soup)
         if not initial_entries:
             return []
@@ -948,6 +1065,10 @@ class WebNovelDownloader:
                 seen_urls.add(href)
                 candidates.append(ChapterLink(self.clean_chapter_title(title), href, len(candidates)))
         return self.sort_chapter_links(candidates)
+
+    def _uses_mobile_directory(self, url, soup):
+        overrides = {"catalog_link_selector", "chapter_link_selector", "catalog_next_selector"}
+        return not overrides.intersection(self.parser.rules) and is_mobile_directory(url, soup)
 
     def collect_catalog_pages(self, start_url: str, start_soup: BeautifulSoup) -> list[tuple[str, BeautifulSoup]]:
         pages = []
@@ -1228,6 +1349,10 @@ class WebNovelDownloader:
             title = self.clean_text(tag.get_text(" ", strip=True))
             title = re.split(r"\s*[>›»]\s*(?=第|chapter\b)", title, flags=re.I)[-1]
             if any(re.search(pattern, title, re.I) for pattern in self.CHAPTER_PATTERNS):
+                return title
+        if soup.title:
+            title = self.clean_text(soup.title.get_text()).split("_", 1)[0]
+            if self.parser.HEADING.match(title):
                 return title
         for selector in ("h1", ".chapter-title", ".title", ".headline"):
             tag = soup.select_one(selector)

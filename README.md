@@ -27,7 +27,7 @@
 
 ### 方式一：下载免安装包（推荐）
 
-1. 打开 [Releases](https://github.com/Liujifa/Mess-Around/releases/latest)，下载 `MoYuReader-v1.0.2-Windows-x64.zip`。
+1. 打开 [Releases](https://github.com/Liujifa/Mess-Around/releases/latest)，下载 `MoYuReader-v1.0.3-Windows-x64.zip`。
 2. 完整解压 ZIP 到本地目录，双击 `MoYuReader.exe`。请保留旁边的 `_internal` 文件夹，不要在压缩软件内部运行。
 3. 启动后直接显示书库。导入 TXT 或从网页下载，选择章节后点击 **开始阅读**。
 
@@ -76,8 +76,9 @@ Windows 上也可以双击 `main.pyw` 进行无控制台启动；它与 `main.py
 | 页面形式 | 识别方式 |
 | --- | --- |
 | HTML 目录 | 根据链接分组、路径和目录结构发现章节，支持无编号标题和多卷目录，过滤导航与推荐书 |
-| 详情页或下载页 | 沿实际目录、开始阅读等入口寻找目录；没有目录时尝试 TXT 下载链接 |
-| 目录分页 | 识别分页路径、查询参数、下一页链接、数字分页和下拉选项，并保留书籍标识 |
+| 详情页或下载页 | 优先跟随「全部目录／全部章节」入口，避免将最新几章当作全书；没有目录时尝试 TXT 下载链接 |
+| 目录分页 | 识别分页路径、查询参数、下一页链接、数字分页和下拉选项，支持 `indexList-书籍ID.html` 与 `indexList/书籍ID/页码.html` 路由切换，并保留书籍标识 |
+| 移动目录 | 支持 38 看书手机模板的章节范围下拉框。遇到重复目录地址时，沿阅读页的「上一章」回溯并核对缺失链接 |
 | 动态目录 | 支持 mopbook 当前使用的 `chapterPageAjxa` 请求协议，从公开脚本读取固定参数，逐页获取目录并验证完整性 |
 | 内嵌 JSON | 读取 JSON-LD、`application/json`、`__NEXT_DATA__` 中的章节列表和正文，不执行脚本 |
 | JSON 接口 | 支持直接输入包含章节 URL 列表或 `chapterContent`、`articleBody` 等字段的接口地址 |
@@ -113,7 +114,10 @@ v1.0.2 已补上 mopbook 的动态目录加载：按页面的书籍编号和章�
 
 ### 完整性、重试与取消
 
-- 通用下载使用共享限速；收到 HTTP 429 时统一冷却，降低请求频率。
+- 下载速度可选「自动降速」或「慢速稳定」。自动模式默认同站至少间隔 1 秒；慢速模式单路运行，同站至少间隔 6 秒，目录、正文、接口共用额度。网速较快也不会突破这个请求频率。
+- 收到 HTTP 429 后，本站全部请求共享冷却，默认从 60 秒开始，后续探测仍失败时逐步延长至 15 分钟；服务端 `Retry-After` 的秒数和 HTTP 日期均会遵守，服务端要求更久时继续等待。状态栏显示等待倒计时，随时可取消。
+- 限流后改为单路续传并保持降速，不会成功几十章后马上恢复高速。降速记录与剩余冷却保存在 `novel_downloads/.request_pacing/`，重新开始或重启软件也会读取；未过期的冷却不会被重启清除。已结束的记录保留 7 天，其他站点分别调度。
+- 冷却探测次数达到上限后停止本次下载并保留缓存，不对每章重复执行整套限流重试。同一网络上其他程序访问本站也可能占用站点额度；慢速模式无法保证绕过站点更严格的限制。
 - 失败章节会额外重试一轮。仍有缺章、分页缺正文、分页循环或超出分页上限时会报告失败，避免把残缺 TXT 作为成功下载入库。
 - 已完成章节保存在 `novel_downloads/.chapter_cache/`。使用同一地址重新下载可复用有效缓存；完整保存成功后清理本次缓存。
 - 点击取消，或下载时从托盘退出，都会先请求取消，再等待当前网络请求和工作线程结束。
@@ -136,6 +140,7 @@ v1.0.2 已补上 mopbook 的动态目录加载：按页面的书籍编号和章�
 | `novel_downloads/*.txt` | 网页下载生成的小说正文 |
 | `小说名.txt.chapters.json` | 对应 TXT 的章节标题、行号与 SHA-256 校验信息 |
 | `novel_downloads/.chapter_cache/` | 尚未完成下载的章节缓存，可以删除后重新抓取 |
+| `novel_downloads/.request_pacing/` | 本站降速记录与冷却截止时间，重启后继续遵守 |
 | `charset.json` | 部分网页正文的字符解码配置 |
 
 建议在退出软件后备份 `library.json` 和小说文件；移动下载 TXT 时一起移动对应的 `.chapters.json`。
@@ -190,7 +195,7 @@ python -m unittest discover -v
 - 文档复用、目录动作释放和读取失败后的状态保留。
 - 书库搜索、空状态、语言切换后的手动选章、短窗口表单滚动，以及发布版数据目录隔离。
 
-其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖异常路径，`test_generic_downloader.py` 覆盖通用解析规则，`test_ui_release.py` 覆盖界面与发布路径，`test_chapter_pagination.py` 覆盖多页章节，`test_cookie_regressions.py` 覆盖 Cookie 导入及验证页保护，`test_ajax_catalog.py` 覆盖动态目录协议。
+其中 `test_core_behaviors.py` 覆盖基础流程，`test_review_regressions.py` 覆盖异常路径，`test_generic_downloader.py` 覆盖通用解析规则，`test_ui_release.py` 覆盖界面与发布路径，`test_chapter_pagination.py` 覆盖多页章节，`test_cookie_regressions.py` 覆盖 Cookie 导入及验证页保护，`test_ajax_catalog.py` 覆盖动态目录协议，`test_request_pacing.py` 用虚拟时钟覆盖共享冷却、HTTP 日期、单路探测、取消与重启后降速。
 
 ### 构建 Windows 发布包
 
@@ -236,6 +241,7 @@ python test_bqg5.py https://example.com/novel/catalog --chapter-links ".chapters
 | `web_novel_downloader.py` | 目录与正文抓取、分页、限速、重试及 TXT 输出 |
 | `novel_page_parser.py` | 通用目录发现、链接分组、分页识别、结构化数据与 CSS 规则 |
 | `ajax_catalog.py` | 已识别动态目录协议的参数编码、分页读取与完整性校验 |
+| `mobile_directory.py` | 移动目录范围分页及重复地址回溯校验 |
 | `browser_cookie_importer.py` | 浏览器与文件 Cookie 导入 |
 | `styles.py` | 书库和阅读器样式 |
 | `app_paths.py` | 应用版本、只读资源和可写数据目录 |
